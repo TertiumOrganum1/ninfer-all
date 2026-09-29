@@ -354,9 +354,12 @@ ProgramImpl::reserve_materialization(AdmissionCandidate&& plan, PreparedPromptDa
                     DeviceSpan{static_cast<std::byte*>(workspace_storage.base()) +
                                    workspace_plan.vision_bridge_offset,
                                workspace_plan.vision_bridge_bytes});
-                // Start the first item now so its window overlaps the decode rounds that run
-                // before this lane gets a prefill unit.
-                request.prefill->vision->submit_next_item();
+                // No early submission here. The sealed plan counted every usable page for this
+                // materialization, and its activation reservation is taken only afterwards; a
+                // KV-funded window opened now would lend exactly those pages (the loan is still
+                // allowed, since the context transaction is not yet published) and the activation
+                // then fails with "context cache exhausted ... lent N" once the pool is near full.
+                // The first item is encoded when the lane reaches its prefill unit instead.
             } else {
                 request.prefill->vision = std::make_unique<execution::VisionPrefillSession>(
                     device, parameters,
