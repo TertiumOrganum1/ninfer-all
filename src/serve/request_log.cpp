@@ -21,9 +21,9 @@
 #include <utility>
 
 #ifdef _WIN32
-#include <process.h>
+#    include <process.h>
 #else
-#include <unistd.h>
+#    include <unistd.h>
 #endif
 
 namespace ninfer::serve {
@@ -385,6 +385,74 @@ Json speculative_json(const GenerationMetrics& metrics) {
     return out;
 }
 
+template <class T>
+Json optional_json(const std::optional<T>& value) {
+    return value ? Json(*value) : Json(nullptr);
+}
+
+Json context_cache_owner_json(const ninfer::ContextCacheOwnerDiagnostics& owner) {
+    return Json{
+        {"kind", owner.kind},
+        {"owner_id", owner.owner_id},
+        {"slot", owner.slot},
+        {"generation", owner.generation},
+        {"session_key", owner.session_key.empty() ? Json(nullptr) : Json(owner.session_key)},
+        {"retention", owner.retention},
+        {"effective_weight", owner.effective_weight},
+        {"age", owner.age},
+        {"frontier_tokens", owner.frontier_tokens},
+        {"rebuild_ns", owner.rebuild_ns},
+        {"placement", Json{{"device_state_slots", optional_json(owner.device_state_slots)},
+                           {"host_state_slots", optional_json(owner.host_state_slots)},
+                           {"device_kv_pages", optional_json(owner.device_kv_pages)},
+                           {"host_kv_pages", optional_json(owner.host_kv_pages)},
+                           {"disk_kv_pages", optional_json(owner.disk_kv_pages)}}}};
+}
+
+template <class T, class Format>
+Json bounded_array_json(const std::vector<T>& values, std::size_t limit, Format format) {
+    Json result = Json::array();
+    for (std::size_t index = 0; index < std::min(limit, values.size()); ++index) {
+        result.push_back(format(values[index]));
+    }
+    return result;
+}
+
+Json materialization_candidate_json(const ninfer::MaterializationCandidateDiagnostics& candidate) {
+    return Json{{"candidate_id", candidate.candidate_id},
+                {"kind", prefix_reuse_path_name(candidate.kind)},
+                {"matched_tokens", candidate.matched_tokens},
+                {"physical_status", candidate.physical_status},
+                {"expandable", candidate.expandable},
+                {"source_mode", candidate.source_mode},
+                {"retention_reason", candidate.retention_reason},
+                {"lower_bound_ns", candidate.lower_bound_ns}};
+}
+
+Json materialization_victim_json(const ninfer::MaterializationVictimDiagnostics& victim) {
+    Json result       = context_cache_owner_json(victim.owner);
+    result["outcome"] = victim.outcome;
+    result["dropped_checkpoints"] =
+        bounded_array_json(victim.dropped_checkpoints, ninfer::kMaximumMaterializationVictims,
+                           [](const ninfer::ContextCacheCheckpointDiagnostics& checkpoint) {
+                               return Json{{"kind", checkpoint.kind},
+                                           {"frontier_tokens", checkpoint.frontier_tokens},
+                                           {"ordinal", checkpoint.ordinal}};
+                           });
+    return result;
+}
+
+Json materialization_rejected_json(const ninfer::MaterializationRejectedPlanDiagnostics& rejected) {
+    return Json{{"candidate_id", rejected.candidate_id},
+                {"target_ordinal", optional_json(rejected.target_ordinal)},
+                {"kind", prefix_reuse_path_name(rejected.kind)},
+                {"matched_tokens", rejected.matched_tokens},
+                {"source_mode", rejected.source_mode},
+                {"now_ns", rejected.now_ns},
+                {"future_loss_ns", rejected.future_loss_ns},
+                {"total_ns", rejected.total_ns}};
+}
+
 Json materialization_json(const ninfer::MaterializationDiagnostics& diagnostics) {
     return Json{
         {"predicted_now_ns", diagnostics.predicted_now_ns},
@@ -414,6 +482,15 @@ Json materialization_json(const ninfer::MaterializationDiagnostics& diagnostics)
         {"search_boundary_limited", diagnostics.search_boundary_limited},
         {"cached_prefix_tokens", diagnostics.cached_prefix_tokens},
         {"restored_host_bytes", diagnostics.restored_host_bytes},
+        {"candidates",
+         bounded_array_json(diagnostics.candidates, ninfer::kMaximumMaterializationCandidates,
+                            materialization_candidate_json)},
+        {"selected_victims",
+         bounded_array_json(diagnostics.selected_victims, ninfer::kMaximumMaterializationVictims,
+                            materialization_victim_json)},
+        {"best_rejected",
+         bounded_array_json(diagnostics.best_rejected, ninfer::kMaximumMaterializationRejectedPlans,
+                            materialization_rejected_json)},
     };
 }
 
@@ -628,13 +705,13 @@ std::string format_request_done(const RequestLogContext& context,
         out << " overlay=" << metrics.overlay_windows << "x"
             << (metrics.overlay_exclusive_windows == metrics.overlay_windows ? "excl"
                 : metrics.overlay_exclusive_windows == 0                     ? "conc"
-                                                                            : "mixed")
-            << " " << std::setprecision(0)
-            << metrics.overlay_window_seconds * 1000.0 << "ms (evict " << std::setprecision(0)
-            << mib(metrics.overlay_evicted_bytes) << "MiB " << std::setprecision(1)
-            << metrics.overlay_evict_seconds * 1000.0 << "ms, restore " << std::setprecision(1)
-            << metrics.overlay_restore_seconds * 1000.0 << "ms, staged " << std::setprecision(0)
-            << mib(metrics.overlay_staged_bytes) << "MiB)" << std::setprecision(2);
+                                                                             : "mixed")
+            << " " << std::setprecision(0) << metrics.overlay_window_seconds * 1000.0
+            << "ms (evict " << std::setprecision(0) << mib(metrics.overlay_evicted_bytes) << "MiB "
+            << std::setprecision(1) << metrics.overlay_evict_seconds * 1000.0 << "ms, restore "
+            << std::setprecision(1) << metrics.overlay_restore_seconds * 1000.0 << "ms, staged "
+            << std::setprecision(0) << mib(metrics.overlay_staged_bytes) << "MiB)"
+            << std::setprecision(2);
     }
     if (metrics.engine_timing.decode_rounds == 0) {
         out << " decode-host=n/a wait=n/a";
@@ -989,14 +1066,14 @@ std::string format_request_done_json(const std::string& server_instance_id, std:
         {"prepare", outcome.metrics.prepare_seconds}, {"ttft", outcome.metrics.ttft_seconds},
         {"vision", outcome.metrics.vision_seconds},   {"prefill", outcome.metrics.prefill_seconds},
         {"decode", outcome.metrics.decode_seconds},   {"total", outcome.metrics.total_seconds}};
-    record["vision_overlay"] = Json{{"windows", outcome.metrics.overlay_windows},
-                                    {"window_seconds", outcome.metrics.overlay_window_seconds},
-                                    {"evict_seconds", outcome.metrics.overlay_evict_seconds},
-                                    {"restore_seconds", outcome.metrics.overlay_restore_seconds},
-                                    {"evicted_bytes", outcome.metrics.overlay_evicted_bytes},
-                                    {"staged_bytes", outcome.metrics.overlay_staged_bytes},
-                                    {"exclusive_windows",
-                                     outcome.metrics.overlay_exclusive_windows}};
+    record["vision_overlay"] =
+        Json{{"windows", outcome.metrics.overlay_windows},
+             {"window_seconds", outcome.metrics.overlay_window_seconds},
+             {"evict_seconds", outcome.metrics.overlay_evict_seconds},
+             {"restore_seconds", outcome.metrics.overlay_restore_seconds},
+             {"evicted_bytes", outcome.metrics.overlay_evicted_bytes},
+             {"staged_bytes", outcome.metrics.overlay_staged_bytes},
+             {"exclusive_windows", outcome.metrics.overlay_exclusive_windows}};
     record["engine_timing"]   = request_engine_timing_json(outcome.metrics.engine_timing);
     record["speculative"]     = speculative_json(outcome.metrics);
     record["materialization"] = materialization_json(outcome.metrics.materialization);
@@ -1087,6 +1164,9 @@ std::string format_throughput_json(const std::string& server_instance_id, std::u
                   microseconds_per(host.stats_publication_ns, host.stats_publication_invocations)}}},
     };
     record["context_cache"] = Json{
+        {"catalog",
+         bounded_array_json(current.context_cache_catalog,
+                            ninfer::kMaximumContextCacheCatalogOwners, context_cache_owner_json)},
         {"captures", Json{{"completed", monotonic_delta(previous.active_captures_completed,
                                                         current.active_captures_completed)},
                           {"aborted", monotonic_delta(previous.active_captures_aborted,

@@ -36,17 +36,16 @@ struct PrefillWork {
     PrefillWork result;
     result.chunks =
         suffix_tokens == 0 || prefill_chunk == 0 ? 0 : 1U + (suffix_tokens - 1U) / prefill_chunk;
-    result.tokens                       = suffix_tokens;
-    result.vision_items                 = vision_items;
-    result.vision_patches               = vision_patches;
+    result.tokens              = suffix_tokens;
+    result.vision_items        = vision_items;
+    result.vision_patches      = vision_patches;
     const core::Uint128 linear = core::wide_multiply(prefix_tokens, suffix_tokens);
     // suffix*(suffix+1)/2 without a 128-bit divide. Exactly one of the two factors is even, so
     // halving that one first keeps both operands inside uint64 even at suffix_tokens ==
     // UINT64_MAX, where suffix_tokens + 1 would otherwise wrap.
     const core::Uint128 triangular =
-        (suffix_tokens & 1U) == 0U
-            ? core::wide_multiply(suffix_tokens >> 1U, suffix_tokens + 1U)
-            : core::wide_multiply(suffix_tokens, (suffix_tokens >> 1U) + 1U);
+        (suffix_tokens & 1U) == 0U ? core::wide_multiply(suffix_tokens >> 1U, suffix_tokens + 1U)
+                                   : core::wide_multiply(suffix_tokens, (suffix_tokens >> 1U) + 1U);
     bool overflowed               = false;
     const core::Uint128 attention = core::wide_add(linear, triangular, overflowed);
     result.attention_pairs        = overflowed ? std::numeric_limits<std::uint64_t>::max()
@@ -206,6 +205,31 @@ enum class PrivateSourceMode : std::uint8_t {
     ConsumeToActive,
 };
 
+enum class PrivateSourceRetentionReason : std::uint8_t {
+    None,
+    SharedSource,
+    SessionOwnership,
+    LongAnchor,
+    EndpointAlias,
+};
+
+[[nodiscard]] inline constexpr const char*
+private_source_retention_reason_name(PrivateSourceRetentionReason reason) noexcept {
+    switch (reason) {
+    case PrivateSourceRetentionReason::None:
+        return "none";
+    case PrivateSourceRetentionReason::SharedSource:
+        return "shared_source";
+    case PrivateSourceRetentionReason::SessionOwnership:
+        return "session_ownership";
+    case PrivateSourceRetentionReason::LongAnchor:
+        return "long_anchor";
+    case PrivateSourceRetentionReason::EndpointAlias:
+        return "endpoint_alias";
+    }
+    return "none";
+}
+
 enum class VictimDisposition : std::uint8_t {
     Retained,
     Evicted,
@@ -267,6 +291,7 @@ struct CheckpointRecoveryAlternativeWork {
 };
 
 struct IdentityMaterializationAssessment {
+    PrivateSourceRetentionReason source_retention_reason = PrivateSourceRetentionReason::None;
     MaterializationPhysicalStatus physical_status =
         MaterializationPhysicalStatus::StructuralInvalid;
     PrivateSourceMode source_mode = PrivateSourceMode::ConsumeToActive;

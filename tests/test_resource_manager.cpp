@@ -761,9 +761,9 @@ public:
         }
         if (shared_source != nullptr) {
             inspected_shared_sources.push_back(shared_source->id);
-            const bool shared_matches = shared_source->content_key == prompt.content_key ||
-                                        (prompt.prefix_key != 0 &&
-                                         shared_source->content_key == prompt.prefix_key);
+            const bool shared_matches =
+                shared_source->content_key == prompt.content_key ||
+                (prompt.prefix_key != 0 && shared_source->content_key == prompt.prefix_key);
             if (!shared_matches || !checkpoint) { return std::nullopt; }
         }
 
@@ -797,8 +797,9 @@ public:
                                     : 0;
         if (source != nullptr) {
             plan.private_source_id = source->id;
-            plan.source_mode =
-                must_retain_source ? PrivateSourceMode::Retain : PrivateSourceMode::ConsumeToActive;
+            plan.source_mode       = (must_retain_source || force_retain_private_source)
+                                         ? PrivateSourceMode::Retain
+                                         : PrivateSourceMode::ConsumeToActive;
         } else if (shared_source != nullptr) {
             plan.shared_source_id          = shared_source->id;
             plan.shared_source_content_key = shared_source->content_key;
@@ -1151,7 +1152,7 @@ public:
 
     [[nodiscard]] bool shared_capture_matches(const FakeCaptureOffer&,
                                               const FakeSharedPrefixHandle&) const {
-        return false;
+        return capture_matches_shared;
     }
 
     void skip_capture(FakeCaptureOffer&&) { ++skipped_captures; }
@@ -1186,13 +1187,15 @@ public:
         }
         pending_plan_.emplace(std::move(pressure));
         pending_capture_publish_shared_ = publish_shared;
-        transaction_kind_               = TransactionKind::Capture;
+        capture_publications.push_back(publish_shared);
+        transaction_kind_ = TransactionKind::Capture;
         advance_revision();
         return ContextTransactionReserveStatus::Reserved;
     }
 
     [[nodiscard]] FakeFinishResult finish(FakeSequenceHandle sequence) noexcept {
         ++finish_calls;
+        owner_frontiers.emplace_back(sequence.id, finish_frontier);
         if (finish_fail_next) {
             finish_fail_next = false;
             return {};
@@ -1273,6 +1276,20 @@ public:
 
     [[nodiscard]] FakePhysicalUsage physical_usage() const noexcept { return usage; }
 
+    mutable std::uint64_t owner_diagnostic_inspections = 0;
+
+    template <class Handle>
+    ninfer::ContextCacheOwnerDiagnostics context_cache_owner_diagnostics(const Handle&) const {
+        ++owner_diagnostic_inspections;
+        ninfer::ContextCacheOwnerDiagnostics result;
+        result.device_state_slots = 1;
+        result.host_state_slots   = 0;
+        result.device_kv_pages    = 1;
+        result.host_kv_pages      = 0;
+        result.disk_kv_pages      = 0;
+        return result;
+    }
+
     void invalidate_resources() noexcept { advance_revision(); }
 
     std::vector<std::pair<std::uint32_t, std::vector<FakeTargetDecision>>> owner_decisions;
@@ -1320,6 +1337,18 @@ public:
     // The private replacement the most recent capture inspection was asked to price.
     mutable std::optional<CheckpointRef> last_capture_private_replacement;
     bool abort_salvage_next                              = false;
+    std::vector<std::pair<std::uint32_t, std::uint32_t>> owner_frontiers;
+
+    std::uint32_t frontier_for_owner(std::uint32_t owner) const {
+        for (auto it = owner_frontiers.rbegin(); it != owner_frontiers.rend(); ++it) {
+            if (it->first == owner) { return it->second; }
+        }
+        return finish_frontier;
+    }
+
+    bool force_retain_private_source = false;
+    bool capture_matches_shared      = false;
+    std::vector<bool> capture_publications;
     bool abort_capture_start                             = false;
     bool report_shared_source_summary                    = false;
     bool change_shared_source_residency_on_second_report = false;
@@ -1336,7 +1365,7 @@ public:
     // pressure planning session (most recent first).
     std::vector<std::uint32_t> observed_recency_ids;
     std::uint64_t pressure_target_assessments = 0;
-    bool capture_feasible_after_release        = false;
+    bool capture_feasible_after_release       = false;
     std::uint64_t start_calls                 = 0;
     std::uint64_t finish_calls                = 0;
     std::uint64_t abort_calls                 = 0;
@@ -1857,9 +1886,11 @@ FakeAssessedPressureTarget FakePressurePlanningSession::assess(FakePressureTarge
         const bool endpoint_survives =
             !decision.evicts_continuation && decision.dropped_checkpoints == 0;
         const std::uint32_t owner_frontier =
-            owners_[index].shared && owners_[index].shared_handle->frontier != 0
-                ? owners_[index].shared_handle->frontier
-                : program_->finish_frontier;
+            owners_[index].shared
+                ? (owners_[index].shared_handle->frontier != 0
+                       ? owners_[index].shared_handle->frontier
+                       : program_->finish_frontier)
+                : program_->frontier_for_owner(owners_[index].private_handle->id);
         append_checkpoint_outcome(CheckpointRef{.kind     = owners_[index].shared
                                                                 ? CheckpointKind::SharedStablePrefix
                                                                 : CheckpointKind::SessionEndpoint,
@@ -2150,6 +2181,7 @@ FakeManager make_manager(std::uint32_t lanes = 1, std::uint32_t private_capacity
 struct ActiveRequest {
     LaneId lane;
     FakeSequenceHandle sequence;
+    ninfer::MaterializationDiagnostics diagnostics;
 };
 
 ActiveRequest start_active(FakeManager& manager, FakeProgram& program, std::uint32_t content_key,
@@ -2178,7 +2210,7 @@ ActiveRequest start_active(FakeManager& manager, FakeProgram& program, std::uint
     manager.adopt(program, std::move(activation));
     require(manager.lane_state(lane) == ninfer::runtime::LogicalLaneState::Active,
             "published lane was not adopted as active");
-    return ActiveRequest{.lane = lane, .sequence = sequence};
+    return ActiveRequest{.lane = lane, .sequence = sequence, .diagnostics = outcome.diagnostics};
 }
 
 void test_private_portfolio_loss_keeps_checkpoint_identity_fixed() {
@@ -2343,6 +2375,89 @@ void test_shared_capture_subtracts_private_transition_loss() {
     require(result && result->baseline_value == 0 && result->target_value == 1000 &&
                 result->immediate_ns == 0 && result->net_gain == 600,
             "shared capture gain did not subtract the private capability transition loss");
+}
+
+void test_private_capture_prices_saving_full_cost_tie_and_saturation() {
+    using Planner = ninfer::runtime::SharedCapturePlanner<FakeModelContract>;
+    FakeProgram program;
+    FakeCaptureAssessment capture{
+        .transfer_requirements   = {ContextTransferRequirement{
+              .direction = ninfer::runtime::ContextTransferDirection::DeviceToHost,
+              .work      = ninfer::TransferWork{.payload_bytes = 900},
+        }},
+        .projected_recovery_work = {fake_recovery_work(100)},
+        .publishes_private       = true,
+    };
+    Planner::Input input{
+        .capture                            = &capture,
+        .candidate_rebuild_ns               = 1000,
+        .candidate_private_retention_weight = 2,
+    };
+    Planner planner;
+    const auto positive = planner.plan(program, test_cost_model(), input);
+    require(positive && positive->target_value == 1800 && positive->immediate_ns == 900 &&
+                positive->net_gain == 900,
+            "private capture did not price retained saving against full capture cost");
+    input.candidate_private_retention_weight = 1;
+    require(!planner.plan(program, test_cost_model(), input),
+            "private capture selected a strict gain tie against Skip");
+    input.candidate_private_retention_weight = 2;
+    input.blocked_runnable_requests          = 1;
+    require(!planner.plan(program, test_cost_model(), input),
+            "private capture omitted the blocked-runnable multiplier from full immediate cost");
+    input.blocked_runnable_requests = 0;
+    capture.projected_recovery_work = {fake_recovery_work(1000)};
+    require(!planner.plan(program, test_cost_model(), input),
+            "private capture counted a checkpoint with no recoverable saving");
+    capture.projected_recovery_work.clear();
+    require(!planner.plan(program, test_cost_model(), input),
+            "private capture invented recovery for an unsupported checkpoint");
+    capture.projected_recovery_work = {fake_recovery_work(0)};
+    capture.transfer_requirements.clear();
+    input.candidate_rebuild_ns = std::numeric_limits<std::uint64_t>::max();
+    require(!planner.plan(program, test_cost_model(), input),
+            "private capture selected a saturated weighted benefit");
+}
+
+void test_private_capture_prices_public_victim_loss() {
+    using Planner = ninfer::runtime::SharedCapturePlanner<FakeModelContract>;
+    FakeProgram program;
+    program.required_pressure_actions             = 1;
+    program.require_evictions                     = true;
+    program.pressure_target_immediate_ns_override = 0;
+    program.pressure_checkpoint_recovery_ns       = 1000;
+    FakeCaptureAssessment capture{
+        .projected_recovery_work = {fake_recovery_work(0)},
+        .publishes_private       = true,
+        .physically_feasible     = false,
+    };
+    FakeContinuationHandle owner{7, 0};
+    const std::array<const FakeContinuationHandle*, 1> owners{&owner};
+    const std::array ids{PlanningOwnerId{.value = 0}};
+    const std::array policies{Planner::OwnerPolicy{.owner = PlanningOwnerId{.value = 0}}};
+    std::array checkpoints{Planner::CheckpointPolicy{
+        .owner       = PlanningOwnerId{.value = 0},
+        .checkpoint  = CheckpointRef{.kind = CheckpointKind::SessionEndpoint, .frontier = 16},
+        .demand_mask = 1,
+        .rebuild_ns  = 1000,
+        .baseline_recovery_ns = 0,
+    }};
+    Planner::Input input{
+        .capture                            = &capture,
+        .private_owners                     = owners,
+        .private_owner_ids                  = ids,
+        .owner_policies                     = policies,
+        .checkpoint_policies                = checkpoints,
+        .candidate_rebuild_ns               = 800,
+        .candidate_private_retention_weight = 1,
+    };
+    Planner planner;
+    require(!planner.plan(program, test_cost_model(), input),
+            "private capture evicted an owner whose public demand loss exceeded its gain");
+    checkpoints.front().demand_mask = 0;
+    const auto positive             = planner.plan(program, test_cost_model(), input);
+    require(positive && positive->net_gain == 800,
+            "private capture rejected the same target after its public loss was removed");
 }
 
 void test_shared_capture_budget_bounds_committed_canonical_targets() {
@@ -2699,6 +2814,15 @@ void test_feasible_identity_expands_when_pressure_can_remove_copy() {
                 program.pressure_planning_sessions == 1 && !program.seal_attempts.empty() &&
                 program.seal_attempts.back() == std::vector<std::uint64_t>{1009},
             "feasible identity suppressed a cheaper complete pressure target");
+    require(std::any_of(result->diagnostics.best_rejected.begin(),
+                        result->diagnostics.best_rejected.end(),
+                        [](const auto& rejected) {
+                            return rejected.candidate_id == 0 && !rejected.target_ordinal &&
+                                   rejected.now_ns == 1'000'000'000 &&
+                                   rejected.future_loss_ns == 0 &&
+                                   rejected.total_ns == 1'000'000'000;
+                        }),
+            "superseded identity incumbent missing from best rejected exact assessments");
 }
 
 void test_dominating_identity_does_not_build_pressure_graph() {
@@ -3255,6 +3379,131 @@ void test_session_publication_order_controls_tied_source() {
                 manager.catalog_state(1) == FakeManager::CatalogState::Catalogued &&
                 manager.catalog_state(2) == FakeManager::CatalogState::Catalogued,
             "session replacement did not retain its old binding as anonymous cache");
+}
+
+void test_catalog_diagnostics_track_publication_and_hit() {
+    FakeManager manager = make_manager(1, 3);
+    FakeProgram program;
+    const auto seed = start_active(manager, program, 751, make_base(751), 1);
+    (void)finish_active(manager, program, seed, 32);
+    ninfer::RuntimeStats stats;
+    manager.populate_runtime_stats(program, stats);
+    require(stats.context_cache_catalog.size() == 1, "catalog diagnostics omitted published owner");
+    const auto& owner = stats.context_cache_catalog.front();
+    require(owner.owner_id == seed.sequence.id && owner.age == 0 && owner.effective_weight == 16 &&
+                owner.frontier_tokens == 32 && owner.retention == "recent_private" &&
+                owner.device_state_slots == 1,
+            "published owner diagnostics lost policy or physical facts");
+    const auto inspections = program.owner_diagnostic_inspections;
+    manager.populate_runtime_stats(program, stats);
+    require(program.owner_diagnostic_inspections == inspections,
+            "unchanged stats publication rescanned inactive KV pages");
+    program.invalidate_resources();
+    manager.populate_runtime_stats(program, stats);
+    require(program.owner_diagnostic_inspections == inspections + 1,
+            "physical resource revision did not refresh owner placement");
+    program.finish_release = true;
+    for (std::uint64_t order = 2; order <= 7; ++order) {
+        const auto transient =
+            start_active(manager, program, 760 + order, make_base(760 + order), order);
+        (void)finish_active(manager, program, transient);
+    }
+    manager.populate_runtime_stats(program, stats);
+    require(stats.context_cache_catalog.size() == 1 &&
+                stats.context_cache_catalog.front().age == 6 &&
+                stats.context_cache_catalog.front().effective_weight == 4,
+            "committed requests did not age the catalog owner");
+    program.finish_release              = false;
+    program.force_retain_private_source = true;
+    const auto successor                = start_active(manager, program, 751, make_base(751), 8);
+    manager.populate_runtime_stats(program, stats);
+    require(stats.context_cache_catalog.front().age == 0 &&
+                stats.context_cache_catalog.front().effective_weight == 16,
+            "successful retained-source hit did not refresh request age");
+    (void)finish_active(manager, program, successor, 40);
+    manager.populate_runtime_stats(program, stats);
+    require(stats.context_cache_catalog.size() == 2 &&
+                stats.context_cache_catalog.front().retention == "disposable" &&
+                stats.context_cache_catalog.front().effective_weight == 1,
+            "catalog diagnostics did not expose retained lineage demotion");
+}
+
+void test_successor_demotes_only_its_completed_lineage() {
+    for (const int scenario : {0, 1, 2, 3}) {
+        FakeManager manager = make_manager(1, 3);
+        FakeProgram program;
+        const std::optional<FakeCacheSessionKey> session =
+            scenario == 0 ? std::nullopt
+                          : std::optional<FakeCacheSessionKey>{FakeCacheSessionKey{1}};
+        const auto retention =
+            session ? RetentionClass::LiveSession : RetentionClass::RecentPrivate;
+        const auto old = start_active(manager, program, 741, make_base(741, session, retention), 1);
+        (void)finish_active(manager, program, old, 48);
+        const auto other = start_active(manager, program, 742, make_base(742), 2);
+        (void)finish_active(manager, program, other, 16);
+        program.force_retain_private_source = true;
+        const auto successor_session =
+            scenario == 3 ? std::optional<FakeCacheSessionKey>{FakeCacheSessionKey{2}} : session;
+        const auto successor =
+            start_active(manager, program, 741, make_base(741, successor_session, retention), 3);
+        require(program.started_source_id == old.sequence.id &&
+                    program.started_source_mode == PrivateSourceMode::Retain,
+                "lineage test did not fork the previous continuation");
+        program.finish_release = scenario == 2;
+        (void)finish_active(manager, program, successor, 56);
+        require(manager.catalog_state(0) == FakeManager::CatalogState::Catalogued &&
+                    program.released_continuations.empty(),
+                "successor publication deleted the resumable previous continuation");
+        program.finish_release            = false;
+        program.required_pressure_actions = 1;
+        program.require_evictions         = true;
+        const auto incoming               = start_active(manager, program, 743, make_base(743), 4);
+        const auto expected =
+            (scenario == 0 || scenario == 1) ? old.sequence.id : other.sequence.id;
+        require(program.started_action_ids == std::vector<std::uint64_t>{2000 + expected},
+                "completed lineage demotion affected a cancelled or unrelated session");
+        (void)finish_active(manager, program, incoming);
+    }
+}
+
+void test_request_recency_protects_recent_small_owner() {
+    FakeManager manager = make_manager(1, 2);
+    FakeProgram program;
+    const auto old = start_active(manager, program, 701, make_base(701), 1);
+    (void)finish_active(manager, program, old, 48);
+    program.finish_release = true;
+    for (std::uint64_t order = 2; order <= 7; ++order) {
+        const auto transient =
+            start_active(manager, program, 710 + order, make_base(710 + order), order);
+        (void)finish_active(manager, program, transient);
+    }
+    program.finish_release = false;
+    const auto recent      = start_active(manager, program, 702, make_base(702), 8);
+    (void)finish_active(manager, program, recent, 20);
+    const auto next = start_active(manager, program, 703, make_base(703), 9);
+    require(program.started_action_ids == std::vector<std::uint64_t>{2000 + old.sequence.id},
+            "full catalog evicted recent small owner instead of old large owner");
+    require(next.diagnostics.selected_victims.size() == 1 &&
+                next.diagnostics.selected_victims.front().owner.owner_id == old.sequence.id &&
+                next.diagnostics.selected_victims.front().owner.age == 7 &&
+                next.diagnostics.selected_victims.front().owner.effective_weight == 4 &&
+                next.diagnostics.selected_victims.front().outcome == "Evicted" &&
+                next.diagnostics.selected_victims.front().dropped_checkpoints.size() == 1,
+            "materialization diagnostics did not identify the actual eviction");
+    (void)finish_active(manager, program, next);
+}
+
+void test_equal_request_age_keeps_size_order() {
+    FakeManager manager = make_manager(2, 2);
+    FakeProgram program;
+    const auto large = start_active(manager, program, 721, make_base(721), 1);
+    const auto small = start_active(manager, program, 722, make_base(722), 2);
+    (void)finish_active(manager, program, large, 48);
+    (void)finish_active(manager, program, small, 20);
+    const auto next = start_active(manager, program, 723, make_base(723), 3);
+    require(program.started_action_ids == std::vector<std::uint64_t>{2000 + small.sequence.id},
+            "equal-age pressure no longer selects smaller owner");
+    (void)finish_active(manager, program, next);
 }
 
 void test_canonical_pressure_starts_with_disposable_owner() {
@@ -3930,7 +4179,7 @@ void test_shared_prefix_serves_a_new_question_after_an_exact_repeat() {
     FakeProgram program;
 
     // The cold request publishes the system prefix as a shared owner.
-    const ActiveRequest cold = start_active(manager, program, 91, system_base(), 1);
+    const ActiveRequest cold   = start_active(manager, program, 91, system_base(), 1);
     program.capture_assessment = FakeCaptureAssessment{
         .shortlist_key          = FakeShortlistKey{.digest = 91, .frontier = 16},
         .shared_evidence        = ninfer::SharedCandidateEvidence::EngineStructural,
@@ -4141,14 +4390,14 @@ void test_infeasible_shared_capture_may_reclaim_without_pressure_evidence() {
         .evidence = ninfer::SharedCandidateEvidence::None,
         .frontier = 64,
     });
-    const ActiveRequest active            = start_active(manager, program, 403, request, 3);
-    program.required_pressure_actions     = 1;
-    program.pressure_action_immediate_ns  = 0;
-    program.capture_assessment            = FakeCaptureAssessment{
-                   .shortlist_key          = FakeShortlistKey{.digest = 403, .frontier = 64},
-                   .protected_rebuild_work = PrefillWork{.tokens = 64},
-                   .publishes_shared       = true,
-                   .physically_feasible    = false,
+    const ActiveRequest active           = start_active(manager, program, 403, request, 3);
+    program.required_pressure_actions    = 1;
+    program.pressure_action_immediate_ns = 0;
+    program.capture_assessment           = FakeCaptureAssessment{
+                  .shortlist_key          = FakeShortlistKey{.digest = 403, .frontier = 64},
+                  .protected_rebuild_work = PrefillWork{.tokens = 64},
+                  .publishes_shared       = true,
+                  .physically_feasible    = false,
     };
 
     const auto reserved =
@@ -4215,18 +4464,16 @@ void test_aborted_shared_capture_start_rolls_back_logical_claims() {
     (void)finish_active(manager, program, active);
 }
 
-// Portfolio arbitration cannot justify publishing a zero-demand private checkpoint over a
-// resident that still carries demand, so a saturated catalog ossifies on the first conversation.
-// A resident whose conversation continued would have been consumed into the active lane, so one
-// left catalogued with no active edge is reclaimable by publication order.
-void test_private_only_capture_reclaims_stale_resident_by_publication_order() {
+// Private capture uses the same complete pressure targets as shared publication.
+void test_private_capture_prefers_preserving_pressure_target() {
     FakeManager manager = make_manager(1, 4, 1);
     FakeProgram program;
     const ActiveRequest resident = start_active(manager, program, 341, make_base(341), 7);
     (void)finish_active(manager, program, resident);
-
-    const ActiveRequest active              = start_active(manager, program, 342, make_base(342), 9);
-    program.capture_feasible_after_release  = true;
+    const ActiveRequest active           = start_active(manager, program, 342, make_base(342), 9);
+    program.required_pressure_actions    = 1;
+    program.pressure_action_immediate_ns = 1;
+    program.pressure_checkpoint_recovery_ns = 1'000'000;
     program.capture_assessment              = FakeCaptureAssessment{
                      .shortlist_key          = FakeShortlistKey{.digest = 342, .frontier = 64},
                      .protected_rebuild_work = PrefillWork{.tokens = 64},
@@ -4234,75 +4481,136 @@ void test_private_only_capture_reclaims_stale_resident_by_publication_order() {
                      .publishes_shared       = false,
                      .physically_feasible    = false,
     };
-
     const auto reserved =
         manager.reserve_active_capture(program, active.lane, FakeCaptureOffer{.id = 71}, 0, {});
-    require(reserved == FakeManager::ActiveCaptureReserveResult::Reserved,
-            "private-only capture did not reclaim a stale resident");
-    require(program.released_continuations.size() == 1,
-            "stale reclamation released the wrong number of continuations");
-    require(manager.catalog_state(0) == FakeManager::CatalogState::Vacant,
-            "reclaimed resident was left catalogued");
-
+    require(reserved == FakeManager::ActiveCaptureReserveResult::Reserved &&
+                program.started_action_ids ==
+                    std::vector<std::uint64_t>{1000U + resident.sequence.id} &&
+                program.released_continuations.empty(),
+            "private capture bypassed a cheaper preserving pressure target");
+    program.capture_summary.rewrite = rewrite_checkpoint(342, 64);
+    auto progress                   = manager.progress_context_transaction(program, {});
+    require(std::get<FakeManager::ActiveCaptureOutcome>(std::move(progress)).status ==
+                    ContextTransactionStatus::Published &&
+                manager.catalog_state(0) == FakeManager::CatalogState::Catalogued,
+            "preserving capture did not retain its pressure victim");
 }
 
-void test_stale_reclamation_prefers_the_oldest_publication_order() {
+void test_private_capture_prefers_lower_loss_owner_over_oldest() {
     FakeManager manager = make_manager(1, 4, 1);
     FakeProgram program;
-    // Catalogued newest-first, so a correct choice cannot come from slot order.
-    const ActiveRequest newer = start_active(manager, program, 351, make_base(351), 40);
-    (void)finish_active(manager, program, newer);
-    const ActiveRequest older = start_active(manager, program, 352, make_base(352), 5);
-    (void)finish_active(manager, program, older);
-
-    const ActiveRequest active             = start_active(manager, program, 353, make_base(353), 60);
-    program.capture_feasible_after_release = true;
-    program.capture_assessment             = FakeCaptureAssessment{
-                    .shortlist_key          = FakeShortlistKey{.digest = 353, .frontier = 64},
-                    .protected_rebuild_work = PrefillWork{.tokens = 64},
-                    .publishes_private      = true,
-                    .publishes_shared       = false,
-                    .physically_feasible    = false,
+    const ActiveRequest newer = start_active(
+        manager, program, 351, make_base(351, std::nullopt, RetentionClass::Disposable), 40);
+    (void)finish_active(manager, program, newer, 16);
+    const ActiveRequest older =
+        start_active(manager, program, 352,
+                     make_base(352, FakeCacheSessionKey{352}, RetentionClass::LiveSession), 5);
+    (void)finish_active(manager, program, older, 128);
+    const ActiveRequest active        = start_active(manager, program, 353, make_base(353), 60);
+    program.required_pressure_actions = 1;
+    program.require_evictions         = true;
+    program.pressure_target_immediate_ns_override = 0;
+    program.pressure_checkpoint_recovery_ns       = 1'000'000;
+    program.capture_assessment                    = FakeCaptureAssessment{
+                           .shortlist_key          = FakeShortlistKey{.digest = 353, .frontier = 64},
+                           .protected_rebuild_work = PrefillWork{.tokens = 64},
+                           .publishes_private      = true,
+                           .publishes_shared       = false,
+                           .physically_feasible    = false,
     };
-
     const auto reserved =
         manager.reserve_active_capture(program, active.lane, FakeCaptureOffer{.id = 72}, 0, {});
-    require(reserved == FakeManager::ActiveCaptureReserveResult::Reserved,
-            "stale reclamation did not reserve");
-    require(program.released_continuations.size() == 1 &&
-                program.released_continuations.front() == older.sequence.id,
-            "stale reclamation did not choose the oldest publication_order");
-
+    require(reserved == FakeManager::ActiveCaptureReserveResult::Reserved &&
+                program.started_action_ids ==
+                    std::vector<std::uint64_t>{2000U + newer.sequence.id} &&
+                program.released_continuations.empty(),
+            "private capture selected publication age instead of priced owner loss");
+    program.capture_summary.rewrite = rewrite_checkpoint(353, 64);
+    auto progress                   = manager.progress_context_transaction(program, {});
+    require(std::get<FakeManager::ActiveCaptureOutcome>(std::move(progress)).status ==
+                    ContextTransactionStatus::Published &&
+                manager.catalog_state(0) == FakeManager::CatalogState::Vacant &&
+                manager.catalog_state(1) == FakeManager::CatalogState::Catalogued,
+            "private capture did not commit only the lower-loss eviction");
 }
 
-// A private-only candidate with no committed demand and no shared credit cannot outvalue a
-// resident, so the pressure search can only return no plan after spending its whole budget on the
-// engine thread. Reclamation settles it without that search.
-void test_zero_value_private_capture_skips_the_pressure_search() {
+void test_coincident_private_shared_capture_uses_common_skip_baseline() {
+    for (const bool exact_shared : {false, true}) {
+        FakeManager manager = make_manager(1, 4, 2);
+        FakeProgram program;
+        const ActiveRequest resident = start_active(manager, program, 391, make_base(391), 1);
+        if (exact_shared) {
+            program.capture_assessment = FakeCaptureAssessment{
+                .shortlist_key          = FakeShortlistKey{.digest = 392, .frontier = 16},
+                .shared_evidence        = ninfer::SharedCandidateEvidence::ExplicitBoundary,
+                .protected_rebuild_work = PrefillWork{.tokens = 16},
+                .publishes_shared       = true,
+            };
+            require(manager.reserve_active_capture(program, resident.lane,
+                                                   FakeCaptureOffer{.id = 81}, 0, {}) ==
+                        FakeManager::ActiveCaptureReserveResult::Reserved,
+                    "exact-shared fixture did not reserve its resident marker");
+            auto progress = manager.progress_context_transaction(program, {});
+            require(std::get<FakeManager::ActiveCaptureOutcome>(std::move(progress)).status ==
+                        ContextTransactionStatus::Published,
+                    "exact-shared fixture did not publish its resident marker");
+        }
+        (void)finish_active(manager, program, resident);
+        const ActiveRequest active        = start_active(manager, program, 393, make_base(393), 2);
+        program.capture_matches_shared    = exact_shared;
+        program.required_pressure_actions = 1;
+        program.required_action_id        = 1000U + resident.sequence.id;
+        program.pressure_action_immediate_ns = 1;
+        program.capture_assessment           = FakeCaptureAssessment{
+                      .shortlist_key          = FakeShortlistKey{.digest = 392, .frontier = 16},
+                      .shared_evidence        = ninfer::SharedCandidateEvidence::ExplicitBoundary,
+                      .protected_rebuild_work = PrefillWork{.tokens = 16},
+                      .publishes_private      = true,
+                      .publishes_shared       = true,
+                      .physically_feasible    = false,
+        };
+        require(manager.reserve_active_capture(program, active.lane, FakeCaptureOffer{.id = 82}, 0,
+                                               {}) ==
+                    FakeManager::ActiveCaptureReserveResult::Reserved,
+                "coincident shared marker vetoed valuable private capture");
+        require(!program.capture_publications.empty() &&
+                    program.capture_publications.back() == !exact_shared,
+                "coincident capture lost common private gain or duplicated an exact shared marker");
+        program.capture_summary.rewrite = rewrite_checkpoint(393, 16);
+        auto progress                   = manager.progress_context_transaction(program, {});
+        require(std::get<FakeManager::ActiveCaptureOutcome>(std::move(progress)).status ==
+                        ContextTransactionStatus::Published &&
+                    manager.catalog_state(0) == FakeManager::CatalogState::Catalogued,
+                "coincident private capture did not preserve and publish its selected target");
+    }
+}
+
+void test_private_capture_without_demand_uses_valued_pressure_search() {
     FakeManager manager = make_manager(1, 4, 1);
     FakeProgram program;
     const ActiveRequest resident = start_active(manager, program, 361, make_base(361), 7);
     (void)finish_active(manager, program, resident);
-
-    const ActiveRequest active             = start_active(manager, program, 362, make_base(362), 9);
-    program.capture_feasible_after_release = true;
-    program.capture_assessment             = FakeCaptureAssessment{
-                    .shortlist_key          = FakeShortlistKey{.digest = 362, .frontier = 64},
-                    .protected_rebuild_work = PrefillWork{.tokens = 64},
-                    .publishes_private      = true,
-                    .publishes_shared       = false,
-                    .physically_feasible    = false,
+    const ActiveRequest active        = start_active(manager, program, 362, make_base(362), 9);
+    program.required_pressure_actions = 1;
+    program.require_evictions         = true;
+    program.pressure_target_immediate_ns_override = 0;
+    program.pressure_checkpoint_recovery_ns       = 1'000'000;
+    program.capture_assessment                    = FakeCaptureAssessment{
+                           .shortlist_key          = FakeShortlistKey{.digest = 362, .frontier = 64},
+                           .protected_rebuild_work = PrefillWork{.tokens = 64},
+                           .publishes_private      = true,
+                           .publishes_shared       = false,
+                           .physically_feasible    = false,
     };
     const std::uint64_t sessions_before = program.pressure_planning_sessions;
-
     const auto reserved =
         manager.reserve_active_capture(program, active.lane, FakeCaptureOffer{.id = 73}, 0, {});
-    require(reserved == FakeManager::ActiveCaptureReserveResult::Reserved,
-            "zero-value private capture did not reclaim a stale resident");
-    require(program.pressure_planning_sessions == sessions_before,
-            "zero-value private capture still ran the pressure search");
-    require(program.released_continuations.size() == 1,
-            "zero-value private capture released the wrong number of continuations");
+    require(reserved == FakeManager::ActiveCaptureReserveResult::Reserved &&
+                program.pressure_planning_sessions > sessions_before &&
+                program.started_action_ids ==
+                    std::vector<std::uint64_t>{2000U + resident.sequence.id} &&
+                program.released_continuations.empty(),
+            "private capture without public demand did not use priced pressure arbitration");
 }
 
 // Shared credit gives the same private-only candidate a value of its own, so arbitration must
@@ -4343,13 +4651,13 @@ void test_stale_reclamation_never_takes_a_retained_active_source() {
     require(program.started_source_mode == PrivateSourceMode::Retain,
             "the resident continuation was consumed instead of retained");
 
-    program.capture_feasible_after_release = true;
-    program.capture_assessment             = FakeCaptureAssessment{
-                    .shortlist_key          = FakeShortlistKey{.digest = 9, .frontier = 64},
-                    .protected_rebuild_work = PrefillWork{.tokens = 64},
-                    .publishes_private      = true,
-                    .publishes_shared       = false,
-                    .physically_feasible    = false,
+    program.required_pressure_actions = 1;
+    program.capture_assessment        = FakeCaptureAssessment{
+               .shortlist_key          = FakeShortlistKey{.digest = 9, .frontier = 64},
+               .protected_rebuild_work = PrefillWork{.tokens = 64},
+               .publishes_private      = true,
+               .publishes_shared       = false,
+               .physically_feasible    = false,
     };
 
     const auto reserved =
@@ -4388,12 +4696,11 @@ void test_stale_reclamation_does_not_run_when_the_capture_is_feasible() {
             "stale reclamation ran even though the capture was already feasible");
     require(manager.catalog_state(0) == FakeManager::CatalogState::Catalogued,
             "a feasible capture reclaimed a resident it did not need");
-
 }
 
-// An admission that had to degrade a resident is pressure deciding which residents to keep; the
-// optional capture of that same request must not reclaim one of them.
-void test_stale_reclamation_leaves_residents_kept_by_admission_pressure() {
+// A replay checkpoint is offered after admission and earlier captures have consumed capacity.
+// Admission pressure does not make inactive residents live or reserve a later replay image.
+void test_response_replay_capture_reclaims_after_admission_pressure() {
     FakeManager manager = make_manager(1, 4, 1);
     FakeProgram program;
     const ActiveRequest resident = start_active(manager, program, 381, make_base(381), 1);
@@ -4407,22 +4714,68 @@ void test_stale_reclamation_leaves_residents_kept_by_admission_pressure() {
                 admitted.pressure_private_owners_evicted == 0,
             "admission did not keep the resident under pressure");
 
-    program.required_pressure_actions      = 0;
-    program.capture_feasible_after_release = true;
-    program.capture_assessment             = FakeCaptureAssessment{
-        .shortlist_key          = FakeShortlistKey{.digest = 382, .frontier = 64},
-        .protected_rebuild_work = PrefillWork{.tokens = 64},
-        .publishes_private      = true,
-        .publishes_shared       = false,
-        .physically_feasible    = false,
+    program.required_pressure_actions             = 1;
+    program.require_evictions                     = true;
+    program.pressure_target_immediate_ns_override = 0;
+    program.pressure_checkpoint_recovery_ns       = 1'000'000;
+    program.capture_assessment                    = FakeCaptureAssessment{
+                           .shortlist_key          = FakeShortlistKey{.digest = 382, .frontier = 64},
+                           .protected_rebuild_work = PrefillWork{.tokens = 64},
+                           .publishes_private      = true,
+                           .publishes_shared       = false,
+                           .physically_feasible    = false,
     };
     const auto reserved =
         manager.reserve_active_capture(program, active.lane, FakeCaptureOffer{.id = 75}, 0, {});
-    require(reserved == FakeManager::ActiveCaptureReserveResult::Skipped,
-            "a capture reclaimed a resident its own admission pressure had kept");
+    require(reserved == FakeManager::ActiveCaptureReserveResult::Reserved,
+            "response replay capture was skipped after admission pressure");
     require(program.released_continuations.empty() &&
+                program.started_action_ids ==
+                    std::vector<std::uint64_t>{2000U + resident.sequence.id},
+            "response replay did not reserve the economically justified eviction");
+    program.capture_summary.rewrite           = rewrite_checkpoint(382, 64);
+    program.capture_summary.rewrite->ref.kind = CheckpointKind::ResponseReplay;
+    auto progress                             = manager.progress_context_transaction(program, {});
+    const auto outcome = std::get<FakeManager::ActiveCaptureOutcome>(std::move(progress));
+    require(outcome.status == ContextTransactionStatus::Published &&
+                !manager.context_transaction_kind() &&
+                manager.lane_state(active.lane) == ninfer::runtime::LogicalLaneState::Active,
+            "response replay capture did not publish while preserving the active lane");
+    RuntimeStats captured;
+    manager.populate_runtime_stats(program, captured);
+    require(captured.pressure_private_owners_degraded == 1 &&
+                captured.pressure_private_owners_evicted == 1 &&
+                manager.catalog_state(0) == FakeManager::CatalogState::Vacant,
+            "response replay reclamation accounting was not committed");
+}
+
+// Optional capture must not bypass the portfolio decision that preserved a valuable session.
+void test_disposable_private_capture_preserves_live_session_after_pressure() {
+    FakeManager manager = make_manager(1, 4, 1);
+    FakeProgram program;
+    const ActiveRequest resident =
+        start_active(manager, program, 391,
+                     make_base(391, FakeCacheSessionKey{391}, RetentionClass::LiveSession), 1);
+    (void)finish_active(manager, program, resident, 256);
+    program.required_pressure_actions = 1;
+    const ActiveRequest active        = start_active(
+        manager, program, 392, make_base(392, std::nullopt, RetentionClass::Disposable), 2);
+    program.require_evictions                     = true;
+    program.pressure_target_immediate_ns_override = 0;
+    program.pressure_checkpoint_recovery_ns       = 1'000'000;
+    program.capture_assessment                    = FakeCaptureAssessment{
+                           .shortlist_key          = FakeShortlistKey{.digest = 392, .frontier = 64},
+                           .protected_rebuild_work = PrefillWork{.tokens = 64},
+                           .publishes_private      = true,
+                           .publishes_shared       = false,
+                           .physically_feasible    = false,
+    };
+    const auto reserved =
+        manager.reserve_active_capture(program, active.lane, FakeCaptureOffer{.id = 76}, 0, {});
+    require(reserved == FakeManager::ActiveCaptureReserveResult::Skipped &&
+                program.released_continuations.empty() &&
                 manager.catalog_state(0) == FakeManager::CatalogState::Catalogued,
-            "the resident kept by admission pressure was released");
+            "short Disposable capture evicted a long LiveSession resident kept by admission");
 }
 
 // Under --recency-eviction the stale reclaim ranks residents by the owner recency the pressure path
@@ -5556,6 +5909,72 @@ void test_value_weights_rank_private_victims_by_rebuild_cost() {
     }
 }
 
+void test_materialization_diagnostics_bound_evaluated_facts() {
+    using namespace ninfer::runtime;
+    using Planner = ninfer::runtime::MaterializationPlanner<FakeModelContract>;
+    FakeProgram program;
+    std::array<FakeAdmissionCandidate, 12> handles;
+    std::array<Planner::CandidateInput, 12> candidates;
+    for (std::uint32_t index = 0; index < handles.size(); ++index) {
+        auto& handle = handles[index];
+        handle.value.prefix_reuse_path =
+            index == 0 ? PrefixReusePath::Root : PrefixReusePath::PrivateEndpoint;
+        handle.value.reusable_prompt_tokens = index * 16;
+        handle.identity.physical_status     = MaterializationPhysicalStatus::Feasible;
+        set_fake_machine_costs(handle.identity.machine_work, (index + 1) * 100, (index + 1) * 100);
+        handle.identity.assessment_digest = index + 1;
+        candidates[index]                 = Planner::CandidateInput{.candidate = &handle,
+                                                                    .id = PlanningCandidateId{.value = index},
+                                                                    .stable_ordinal = index};
+    }
+    handles[2].identity.physical_status         = MaterializationPhysicalStatus::StructuralInvalid;
+    handles[7].identity.physical_status         = MaterializationPhysicalStatus::Infeasible;
+    handles[3].identity.source_mode             = PrivateSourceMode::Retain;
+    handles[3].identity.source_retention_reason = PrivateSourceRetentionReason::EndpointAlias;
+    const auto logical_goal =
+        [](PlanningCandidateId id, PrivateSourceMode,
+           std::span<const PressureOwnerOutcome>) -> std::optional<Planner::LogicalGoal> {
+        if (id.value == 1) { return std::nullopt; }
+        return Planner::LogicalGoal{.publication_slot = 0};
+    };
+    Planner planner;
+    const auto result = planner.plan(
+        program, FakePreparedPrompt{}, test_cost_model(), candidates, 0,
+        [] { return Planner::PressureInputs{}; }, logical_goal, Planner::Clock::now(),
+        PlanningAllowance{.limit_ns = 0});
+    require(result && result->candidate.value == 0,
+            "diagnostic fixture did not select the cheapest identity");
+    const auto& diagnostics = result->diagnostics;
+    require(diagnostics.candidates.size() == 8 && diagnostics.best_rejected.size() == 3,
+            "planner candidate/rejected diagnostics exceeded bounds or omitted evaluated plans");
+    const auto& source = diagnostics.candidates[3];
+    require(source.candidate_id == 3 && source.kind == PrefixReusePath::PrivateEndpoint &&
+                source.matched_tokens == 48 && source.physical_status == "feasible" &&
+                !source.expandable && source.source_mode == "retain" &&
+                source.retention_reason == "endpoint_alias" && source.lower_bound_ns == 400 &&
+                diagnostics.candidates[7].physical_status == "infeasible",
+            "candidate diagnostic facts differ from the exact identity assessment");
+    for (std::uint32_t index = 0; index < diagnostics.best_rejected.size(); ++index) {
+        const auto& rejected = diagnostics.best_rejected[index];
+        require(rejected.candidate_id == index + 3 && !rejected.target_ordinal &&
+                    rejected.now_ns == (index + 4) * 100 && rejected.future_loss_ns == 0 &&
+                    rejected.total_ns == rejected.now_ns,
+                "best rejected included the selected, infeasible or logically rejected identity");
+    }
+    set_fake_machine_costs(handles[9].identity.machine_work, 50, 50);
+    const auto later = planner.plan(
+        program, FakePreparedPrompt{}, test_cost_model(), candidates, 0,
+        [] { return Planner::PressureInputs{}; }, logical_goal, Planner::Clock::now(),
+        PlanningAllowance{.limit_ns = 0});
+    require(later && later->candidate.value == 9 && later->diagnostics.candidates.size() == 8 &&
+                later->diagnostics.candidates.back().candidate_id == 9 &&
+                later->diagnostics.candidates.back().matched_tokens == 144 &&
+                later->diagnostics.candidates.back().lower_bound_ns == 50 &&
+                later->diagnostics.best_rejected.size() == 3 &&
+                later->diagnostics.best_rejected.front().candidate_id == 0,
+            "selected candidate outside the initial diagnostic bound was omitted");
+}
+
 int main() {
     TimerResolution timer_resolution;
     run_test("state transfer payload statistics", test_state_transfer_statistics_use_payload_bytes);
@@ -5565,6 +5984,13 @@ int main() {
              test_endpoint_anchor_frontier_keeps_a_matched_endpoint_far_above_its_anchors);
     run_test("long-anchor reuse keeps the conversation only where it forks",
              test_long_anchor_reuse_retains_the_conversation_only_where_it_forks);
+    run_test("catalog policy facts", test_catalog_diagnostics_track_publication_and_hit);
+    run_test("bounded materialization facts",
+             test_materialization_diagnostics_bound_evaluated_facts);
+    run_test("successful lineage demotion", test_successor_demotes_only_its_completed_lineage);
+    run_test("request recency protects recent small owner",
+             test_request_recency_protects_recent_small_owner);
+    run_test("equal request age size order", test_equal_request_age_keeps_size_order);
     run_test("independent complete-target oracle",
              test_complete_search_against_small_exhaustive_oracle);
     run_test("publication-only construction",
@@ -5580,6 +6006,9 @@ int main() {
     run_test("portfolio demand and owner aggregation", test_portfolio_demand_and_owner_aggregation);
     run_test("shared capture private transition loss",
              test_shared_capture_subtracts_private_transition_loss);
+    run_test("private capture full cost, strict tie and saturation",
+             test_private_capture_prices_saving_full_cost_tie_and_saturation);
+    run_test("private capture public victim loss", test_private_capture_prices_public_victim_loss);
     run_test("shared capture committed target budget",
              test_shared_capture_budget_bounds_committed_canonical_targets);
     run_test("equal lower-bound tie-break",
@@ -5649,22 +6078,24 @@ int main() {
              test_infeasible_shared_capture_may_reclaim_without_pressure_evidence);
     run_test("aborted shared capture logical rollback",
              test_aborted_shared_capture_start_rolls_back_logical_claims);
-    run_test("stale private reclamation by publication order",
-             test_private_only_capture_reclaims_stale_resident_by_publication_order);
-    run_test("stale reclamation prefers oldest publication order",
-             test_stale_reclamation_prefers_the_oldest_publication_order);
-    run_test("zero-value private capture skips the pressure search",
-             test_zero_value_private_capture_skips_the_pressure_search);
+    run_test("private capture prefers preserving pressure",
+             test_private_capture_prefers_preserving_pressure_target);
+    run_test("private capture prefers lower-loss owner",
+             test_private_capture_prefers_lower_loss_owner_over_oldest);
+    run_test("coincident private/shared capture common Skip baseline",
+             test_coincident_private_shared_capture_uses_common_skip_baseline);
+    run_test("private capture without public demand uses valued search",
+             test_private_capture_without_demand_uses_valued_pressure_search);
     run_test("credited private capture keeps the pressure search",
              test_credited_private_capture_keeps_the_pressure_search);
     run_test("stale reclamation never takes a retained active source",
              test_stale_reclamation_never_takes_a_retained_active_source);
     run_test("stale reclamation is not run for a feasible capture",
              test_stale_reclamation_does_not_run_when_the_capture_is_feasible);
-    run_test("stale reclamation leaves residents kept by admission pressure",
-             test_stale_reclamation_leaves_residents_kept_by_admission_pressure);
-    run_test("stale reclamation ranks by recency under recency eviction",
-             test_stale_reclamation_ranks_by_recency_under_recency_eviction);
+    run_test("response replay capture reclaims after admission pressure",
+             test_response_replay_capture_reclaims_after_admission_pressure);
+    run_test("Disposable private capture preserves LiveSession after pressure",
+             test_disposable_private_capture_preserves_live_session_after_pressure);
     run_test("validate complete capture result before adoption",
              test_capture_result_is_validated_before_any_adoption);
     run_test("capture result owner identity", test_capture_result_is_adopted_by_owner_identity);

@@ -786,11 +786,11 @@ public:
                 }
             }
         }
-        if (exact_shared != nullptr) {
-            if (!private_baseline.publishes_private || !private_baseline.physically_feasible) {
-                program.skip_capture(std::move(offer));
-                return ActiveCaptureReserveResult::Skipped;
-            }
+        if (exact_shared != nullptr && !private_baseline.publishes_private) {
+            program.skip_capture(std::move(offer));
+            return ActiveCaptureReserveResult::Skipped;
+        }
+        if (exact_shared != nullptr && private_baseline.physically_feasible) {
             transaction_.template emplace<ActiveCaptureRecord>(ActiveCaptureRecord{
                 .lane              = lane,
                 .publishes_private = true,
@@ -803,6 +803,8 @@ public:
             }
             return ActiveCaptureReserveResult::Reserved;
         }
+
+        if (exact_shared != nullptr) { candidate.publishes_shared = false; }
 
         struct CaptureScenario {
             CaptureAssessment assessment;
@@ -824,15 +826,10 @@ public:
 
         std::optional<SelectedCapture> selected;
         std::vector<PlanningOwnerRecord> capture_owner_records;
-        // A private-only publication has no shared slot to displace, so it never reached the
-        // pressure planner and was skipped outright once the physical State pools filled.  The
-        // catalogs are deliberately oversubscribed against those pools, so every publication
-        // route needs a reclamation option or the first conversation owns the cache forever.
-        // A lane whose own admission had to degrade or evict owners is the exception: pressure
-        // has just decided which residents to keep, and an optional capture does not overturn it.
+        // A later private checkpoint needs its own pressure target even if admission already
+        // reclaimed resources or this offer also contains an optional shared publication.
         const bool private_only_pressure =
-            !candidate.publishes_shared && private_baseline.publishes_private &&
-            !private_baseline.physically_feasible && !active_[lane.value].admitted_under_pressure;
+            private_baseline.publishes_private && !private_baseline.physically_feasible;
         if (candidate.publishes_shared || private_only_pressure) {
             // Declared credit means the client (ExplicitBoundary) or a system default
             // (RequestedAutomatic) gave this candidate an explicit retention standing. Automatic
@@ -865,20 +862,9 @@ public:
                     active_[lane.value].extended_resident_keys);
             }
 
-            // A private-only candidate with no committed demand and no shared credit adds no public
-            // value, while every pressure target can only lower a resident's, so its search would
-            // spend the whole target budget on the engine thread and return no plan. Leave it to
-            // the stale-resident reclamation below, which is where that search ends anyway.
-            const bool private_candidate_valued =
-                committed_demand_mask_for(private_baseline.shortlist_key) != 0 ||
-                has_shared_candidate_evidence(private_baseline.shared_evidence,
-                                              SharedCandidateEvidence::ExplicitBoundary) ||
-                has_shared_candidate_evidence(private_baseline.shared_evidence,
-                                              SharedCandidateEvidence::RequestedAutomatic);
-
             std::vector<CaptureScenario> scenarios;
             scenarios.reserve(static_cast<std::size_t>(shared_catalog_count_) + 1U);
-            if (private_only_pressure && private_candidate_valued) {
+            if (private_only_pressure) {
                 scenarios.push_back(CaptureScenario{
                     .assessment       = private_baseline,
                     .publication_slot = kInvalidCatalogSlot,
@@ -886,8 +872,8 @@ public:
                 });
             }
             bool vacant_publication = false;
-            for (std::uint32_t slot = 0;
-                 candidate.publishes_shared && slot < shared_catalog_count_; ++slot) {
+            for (std::uint32_t slot = 0; candidate.publishes_shared && slot < shared_catalog_count_;
+                 ++slot) {
                 if (shared_catalog_[slot].state != SharedCatalogState::Vacant) { continue; }
                 scenarios.push_back(CaptureScenario{
                     .assessment       = candidate,
@@ -973,7 +959,7 @@ public:
                 owner_policies.push_back(typename CapturePlanner::OwnerPolicy{
                     .owner                    = owner,
                     .last_hit_epoch           = owner_recency_epoch(entry),
-                    .private_retention_weight = private_retention_weight(entry.retention),
+                    .private_retention_weight = effective_private_retention_weight(entry),
                 });
                 if (entry.summary.endpoint) {
                     append_private_checkpoint(owner, slot, *entry.summary.endpoint);
@@ -1098,8 +1084,16 @@ public:
                         rolling_inherited_demand(lane),
                     .candidate_rebuild_ns =
                         cost_model_.prefill_ns(scenario.assessment.protected_rebuild_work),
-                    .private_baseline_immediate_ns = price_context_transfer_requirements(
-                        cost_model_, private_baseline.transfer_requirements),
+                    .candidate_private_retention_weight =
+                        !private_baseline.physically_feasible &&
+                                scenario.assessment.publishes_private
+                            ? effective_private_retention_weight(active_[lane.value].retention, 0)
+                            : 0,
+                    .private_baseline_immediate_ns =
+                        private_baseline.physically_feasible
+                            ? price_context_transfer_requirements(
+                                  cost_model_, private_baseline.transfer_requirements)
+                            : 0,
                     .blocked_runnable_requests = blocked_runnable_requests,
                     .stable_scenario_ordinal   = scenario.stable_ordinal,
                     .target_budget             = scenario_budget,
@@ -1137,27 +1131,6 @@ public:
         }
 
         if (!selected) {
-            // Portfolio arbitration cannot resolve a private-only publication whose shortlist key
-            // has no committed demand: the candidate's public value is zero while a resident's is
-            // not, so the transition can never clear a threshold that starts at the baseline it
-            // reduces.  A resident whose conversation continued would have been CONSUMED into the
-            // active lane rather than left contending, so one still catalogued here with no active
-            // edge belongs to a finished conversation.  Reclaim the oldest such resident, and only
-            // after normal arbitration has already declined to produce a plan.
-            if (private_only_pressure && private_baseline.publishes_private &&
-                !private_baseline.physically_feasible &&
-                reclaim_stale_private_resident(program, lane)) {
-                private_baseline =
-                    program.inspect_capture(offer, nullptr, nullptr, std::nullopt, false);
-                private_replacement.reset();
-                if (!private_baseline.private_replacement_candidates.empty()) {
-                    private_replacement = select_long_anchor_replacement(
-                        private_baseline.private_replacement_candidates,
-                        private_baseline.shortlist_key.frontier);
-                    private_baseline = program.inspect_capture(offer, nullptr, nullptr,
-                                                               private_replacement, false);
-                }
-            }
             if (!private_baseline.publishes_private || !private_baseline.physically_feasible) {
                 program.skip_capture(std::move(offer));
                 return ActiveCaptureReserveResult::Skipped;
@@ -1262,8 +1235,8 @@ public:
                     shared_active_edge_count(record.publication_slot) != 0) {
                     throw std::logic_error("selected vacant shared publication slot changed");
                 }
-            } else if (publication.state != SharedCatalogState::Catalogued ||
-                       !publication.handle || publication.id != record.replacement_id ||
+            } else if (publication.state != SharedCatalogState::Catalogued || !publication.handle ||
+                       publication.id != record.replacement_id ||
                        publication.revision != record.replacement_revision ||
                        publication.transaction_pins != 0 ||
                        shared_active_edge_count(record.publication_slot) != 0) {
@@ -1380,8 +1353,9 @@ public:
         publication.handle.emplace(std::move(*result.continuation));
         result.continuation.reset();
         publication.session           = active.session;
-        publication.retention         = RetentionClass::Disposable;
-        publication.publication_order = active.publication_order;
+        publication.retention               = RetentionClass::Disposable;
+        publication.publication_order       = active.publication_order;
+        publication.last_touch_demand_epoch = demand_epoch_;
         migrate_observations(publication, result.summary, publication.retention);
         touch_catalog_entry(publication);
         advance_revision(publication.revision);
@@ -1395,6 +1369,7 @@ public:
     }
 
     [[nodiscard]] FinishResult finish(Program& program, LaneId lane, SequenceHandle sequence) {
+        catalog_diagnostics_cached_ = false;
         require_lane(lane, LogicalLaneState::TerminalPending);
         if (!std::holds_alternative<std::monostate>(transaction_) ||
             program.has_context_transaction()) {
@@ -1455,14 +1430,16 @@ public:
             throw std::logic_error("Program returned an invalid terminal continuation");
         }
 
+        const auto retained_source = active.retained_private_source;
         release_active_references(lane);
         publication.state = CatalogState::Catalogued;
         assign_continuation_summary(publication.summary, result.summary);
         publication.handle.emplace(std::move(*result.continuation));
         result.continuation.reset();
-        publication.session           = active.session;
-        publication.retention         = active.retention;
-        publication.publication_order = active.publication_order;
+        publication.session                 = active.session;
+        publication.retention               = active.retention;
+        publication.publication_order       = active.publication_order;
+        publication.last_touch_demand_epoch = demand_epoch_;
         migrate_observations(publication, result.summary, active.retention);
         touch_catalog_entry(publication);
         advance_revision(publication.revision);
@@ -1472,6 +1449,17 @@ public:
                 rank_superseded_publication(publication, *publication.session);
                 publication.session.reset();
                 publication.retention = RetentionClass::RecentPrivate;
+            }
+        }
+        if (retained_source && (!active.session || (active.update_session_index &&
+                                                    publication.session == active.session))) {
+            CatalogEntry& source = catalog_.at(retained_source->slot);
+            if (source.state == CatalogState::Catalogued && source.handle &&
+                source.id == retained_source->owner.id &&
+                source.publication_order < active.publication_order &&
+                (!source.session || source.session == active.session)) {
+                erase_session_if_owner(source.id);
+                demote_completed_lineage(source);
             }
         }
         reset_active_entry(active);
@@ -1542,7 +1530,7 @@ public:
         }
     }
 
-    void populate_runtime_stats(Program& program, RuntimeStats& out) const noexcept {
+    void populate_runtime_stats(Program& program, RuntimeStats& out) const {
         out.state_moves                        = context_stats_.state_moves;
         out.state_forks                        = context_stats_.state_forks;
         out.state_restores                     = context_stats_.state_restores;
@@ -1602,6 +1590,33 @@ public:
                 shared_references += active_[lane].shared_sources.size();
             }
         }
+        const auto diagnostics_revision = program.resource_revision();
+        if (!catalog_diagnostics_cached_ || diagnostics_revision != catalog_diagnostics_revision_ ||
+            demand_epoch_ != catalog_diagnostics_epoch_) {
+            catalog_diagnostics_cache_.clear();
+            for (std::uint32_t slot = 0;
+                 slot < catalog_count_ &&
+                 catalog_diagnostics_cache_.size() < kMaximumContextCacheCatalogOwners;
+                 ++slot) {
+                const CatalogEntry& entry = catalog_[slot];
+                if (entry.state == CatalogState::Catalogued && entry.handle) {
+                    catalog_diagnostics_cache_.push_back(private_owner_diagnostics(program, slot));
+                }
+            }
+            for (std::uint32_t slot = 0;
+                 slot < shared_catalog_count_ &&
+                 catalog_diagnostics_cache_.size() < kMaximumContextCacheCatalogOwners;
+                 ++slot) {
+                const SharedCatalogEntry& entry = shared_catalog_[slot];
+                if (entry.state == SharedCatalogState::Catalogued && entry.handle) {
+                    catalog_diagnostics_cache_.push_back(shared_owner_diagnostics(program, slot));
+                }
+            }
+            catalog_diagnostics_revision_ = diagnostics_revision;
+            catalog_diagnostics_epoch_    = demand_epoch_;
+            catalog_diagnostics_cached_   = true;
+        }
+        out.context_cache_catalog    = catalog_diagnostics_cache_;
         out.shared_active_references = shared_references > std::numeric_limits<std::uint32_t>::max()
                                            ? std::numeric_limits<std::uint32_t>::max()
                                            : static_cast<std::uint32_t>(shared_references);
@@ -1729,6 +1744,7 @@ public:
     }
 
     void clear_after_program_cleanup() noexcept {
+        catalog_diagnostics_cached_ = false;
         transaction_.template emplace<std::monostate>();
         for (CatalogEntry& entry : catalog_) {
             entry.handle.reset();
@@ -1799,6 +1815,9 @@ private:
         // continuation even clears the consumed source's history), so without this stamp every
         // conversation that is being continued normally would rank as the oldest owner.
         std::uint64_t last_touch_epoch = 0;
+        // Committed-request count at the last publication or selected hit; the age that scales the
+        // private retention weight is measured from it.
+        std::uint64_t last_touch_demand_epoch = 0;
     };
 
     struct SharedCatalogEntry {
@@ -1808,9 +1827,10 @@ private:
         SharedPrefixSummary summary;
         std::optional<SharedPrefixHandle> handle;
         RetentionObservation observation{.retention_class = RetentionClass::SharedStable};
-        std::uint32_t transaction_pins    = 0;
-        bool explicit_credit              = false;
-        std::uint64_t credit_expiry_epoch = 0;
+        std::uint32_t transaction_pins        = 0;
+        std::uint64_t last_touch_demand_epoch = 0;
+        bool explicit_credit                  = false;
+        std::uint64_t credit_expiry_epoch     = 0;
         // Retention epoch at which this prefix was published; see CatalogEntry::last_touch_epoch.
         std::uint64_t last_touch_epoch = 0;
     };
@@ -1848,8 +1868,6 @@ private:
         RetentionClass retention        = RetentionClass::RecentPrivate;
         bool update_session_index       = true;
         std::uint64_t publication_order = 0;
-        // Admission degraded or evicted another owner to place this lane.
-        bool admitted_under_pressure = false;
         std::optional<ActiveOwnerEdge> retained_private_source;
         std::vector<ActiveOwnerEdge> shared_sources;
         // Resident keys the request matched exactly at their frontiers: each is a prefix of its
@@ -1948,7 +1966,6 @@ private:
         active.retained_private_source.reset();
         active.shared_sources.clear();
         active.extended_resident_keys.clear();
-        active.admitted_under_pressure = false;
     }
 
     [[nodiscard]] static std::size_t checked_prefix_index_capacity(std::uint32_t private_capacity,
@@ -1971,10 +1988,11 @@ private:
         if (value != std::numeric_limits<std::uint64_t>::max()) { ++value; }
     }
 
-    // The window has to outlast the distance between two requests that share a prefix. At 32 it does
-    // not: upstream #236 replays 39 distinct prefixes twice, so the first pass's demand record is
-    // evicted before the second pass asks for the same key, every candidate reads as a single reuse
-    // domain, and a shared publication can never be worth making. 64 covers that replay distance.
+    // The window has to outlast the distance between two requests that share a prefix. At 32 it
+    // does not: upstream #236 replays 39 distinct prefixes twice, so the first pass's demand record
+    // is evicted before the second pass asks for the same key, every candidate reads as a single
+    // reuse domain, and a shared publication can never be worth making. 64 covers that replay
+    // distance.
     static constexpr std::size_t kDemandWindowCapacity = 64U;
 
     static void append_unique(std::vector<PrefixShortlistKey>& destination,
@@ -2022,7 +2040,9 @@ private:
         for (std::size_t index = begin; index < demand_window_.size(); ++index, ++bit) {
             if (demand_matches(demand_window_[index], key)) { mask |= 1ULL << bit; }
         }
-        if (bit < kDemandWindowCapacity && demand_matches(provisional, key)) { mask |= 1ULL << bit; }
+        if (bit < kDemandWindowCapacity && demand_matches(provisional, key)) {
+            mask |= 1ULL << bit;
+        }
         return mask;
     }
 
@@ -2118,6 +2138,100 @@ private:
             return 0;
         }
         return 0;
+    }
+
+    // Ages are committed request counts, independent of wall time and checkpoint hit count.
+    static constexpr std::array<std::uint64_t, 4> kPrivateRecencyAgeLimits{1, 4, 16, 64};
+
+    [[nodiscard]] std::uint64_t private_age(const CatalogEntry& entry) const noexcept {
+        return demand_epoch_ >= entry.last_touch_demand_epoch
+                   ? demand_epoch_ - entry.last_touch_demand_epoch
+                   : 0;
+    }
+
+    [[nodiscard]] static std::uint32_t
+    effective_private_retention_weight(RetentionClass retention, std::uint64_t age) noexcept {
+        const std::uint32_t base = private_retention_weight(retention);
+        if (retention == RetentionClass::Disposable || base == 0) { return base; }
+        if (age <= kPrivateRecencyAgeLimits[0]) { return base * 4U; }
+        if (age <= kPrivateRecencyAgeLimits[1]) { return base * 2U; }
+        if (age <= kPrivateRecencyAgeLimits[2]) { return base; }
+        return std::max(1U, base / (age <= kPrivateRecencyAgeLimits[3] ? 2U : 4U));
+    }
+
+    [[nodiscard]] std::uint32_t
+    effective_private_retention_weight(const CatalogEntry& entry) const noexcept {
+        return effective_private_retention_weight(entry.retention, private_age(entry));
+    }
+
+    [[nodiscard]] static const char* retention_class_name(RetentionClass retention) noexcept {
+        switch (retention) {
+        case RetentionClass::Disposable:
+            return "disposable";
+        case RetentionClass::RecentPrivate:
+            return "recent_private";
+        case RetentionClass::LiveSession:
+            return "live_session";
+        case RetentionClass::SharedStable:
+            return "shared_stable";
+        }
+        return "unknown";
+    }
+
+    [[nodiscard]] static const char* checkpoint_kind_name(CheckpointKind kind) noexcept {
+        switch (kind) {
+        case CheckpointKind::SessionEndpoint:
+            return "private_endpoint";
+        case CheckpointKind::TurnClosure:
+            return "turn_closure";
+        case CheckpointKind::ResponseReplay:
+            return "response_replay";
+        case CheckpointKind::LongAnchor:
+            return "long_anchor";
+        case CheckpointKind::SharedStablePrefix:
+            return "shared_stable_prefix";
+        }
+        return "unknown";
+    }
+
+    [[nodiscard]] ContextCacheOwnerDiagnostics private_owner_diagnostics(Program& program,
+                                                                         std::uint32_t slot) const {
+        const CatalogEntry& entry = catalog_.at(slot);
+        auto result               = program.context_cache_owner_diagnostics(*entry.handle);
+        result.kind               = "private_continuation";
+        result.owner_id           = entry.id;
+        result.slot               = slot;
+        result.generation         = entry.revision;
+        result.session_key = entry.session ? std::string(entry.session->view()) : std::string{};
+        result.retention   = retention_class_name(entry.retention);
+        result.effective_weight = effective_private_retention_weight(entry);
+        result.age              = private_age(entry);
+        const auto append       = [&](const auto& checkpoint) {
+            result.frontier_tokens = std::max(result.frontier_tokens, checkpoint.ref.frontier);
+            result.rebuild_ns =
+                std::max(result.rebuild_ns, cost_model_.prefill_ns(checkpoint.rebuild_work));
+        };
+        if (entry.summary.endpoint) { append(*entry.summary.endpoint); }
+        if (entry.summary.rewrite) { append(*entry.summary.rewrite); }
+        for (const auto& checkpoint : entry.summary.long_anchors) { append(checkpoint); }
+        return result;
+    }
+
+    [[nodiscard]] ContextCacheOwnerDiagnostics shared_owner_diagnostics(Program& program,
+                                                                        std::uint32_t slot) const {
+        const SharedCatalogEntry& entry = shared_catalog_.at(slot);
+        auto result                     = program.context_cache_owner_diagnostics(*entry.handle);
+        result.kind                     = "shared_prefix";
+        result.owner_id                 = entry.id;
+        result.slot                     = slot;
+        result.generation               = entry.revision;
+        result.retention                = "shared_stable";
+        result.age                      = demand_epoch_ >= entry.last_touch_demand_epoch
+                                              ? demand_epoch_ - entry.last_touch_demand_epoch
+                                              : 0;
+        result.frontier_tokens          = entry.summary.checkpoint.ref.frontier;
+        result.rebuild_ns = cost_model_.prefill_ns(entry.summary.checkpoint.rebuild_work);
+        return result;
     }
 
     void require_lane(LaneId lane, LogicalLaneState expected) const {
@@ -2266,9 +2380,10 @@ private:
         entry.handle.reset();
         entry.session.reset();
         entry.observations.clear();
-        entry.retention         = RetentionClass::RecentPrivate;
-        entry.publication_order = 0;
-        entry.last_touch_epoch  = 0;
+        entry.retention               = RetentionClass::RecentPrivate;
+        entry.publication_order       = 0;
+        entry.last_touch_epoch        = 0;
+        entry.last_touch_demand_epoch = 0;
         advance_revision(entry.revision);
     }
 
@@ -2423,47 +2538,6 @@ private:
         const SharedCatalogEntry& entry = shared_catalog_[index.slot];
         return entry.state == SharedCatalogState::Catalogued && entry.handle &&
                entry.id == index.owner_id && entry.revision == index.revision;
-    }
-
-    // Releases the oldest catalogued private continuation that no live request can reach, by
-    // publication_order, or under --recency-eviction by the owner recency the pressure path ranks
-    // with, so a resident a later request reused outlives a newer one nobody did. Ties break by
-    // slot for determinism.
-    [[nodiscard]] bool reclaim_stale_private_resident(Program& program, LaneId lane) {
-        const ActiveEntry& active = active_[lane.value];
-        std::uint32_t victim      = kInvalidCatalogSlot;
-        std::uint64_t oldest      = std::numeric_limits<std::uint64_t>::max();
-        for (std::uint32_t slot = 0; slot < catalog_count_; ++slot) {
-            const CatalogEntry& entry = catalog_[slot];
-            if (entry.state != CatalogState::Catalogued || !entry.handle ||
-                private_has_active_edge(slot)) {
-                continue;
-            }
-            // Never the source this request materialized from.  A Retain source already holds an
-            // active edge; this states the intent for both source modes rather than relying on it.
-            if (active.retained_private_source && active.retained_private_source->slot == slot) {
-                continue;
-            }
-            const std::uint64_t age =
-                recency_eviction_ ? owner_recency_epoch(entry) : entry.publication_order;
-            if (age < oldest) {
-                oldest = age;
-                victim = slot;
-            }
-        }
-        if (victim == kInvalidCatalogSlot) { return false; }
-        CatalogEntry& entry             = catalog_[victim];
-        const std::uint32_t checkpoints = continuation_checkpoint_count(entry.summary);
-        if (program.release_continuation(std::move(*entry.handle)).status !=
-            ConsumeStatus::Consumed) {
-            return false;
-        }
-        erase_session_if_owner(entry.id);
-        clear_catalog_entry(entry);
-        rebuild_prefix_index();
-        saturating_increment(context_stats_.pressure_private_owners_evicted);
-        record_checkpoint_drops(context_stats_, checkpoints);
-        return true;
     }
 
     [[nodiscard]] std::uint64_t newest_hit_epoch(const CatalogEntry& entry) const noexcept {
@@ -2631,7 +2705,7 @@ private:
             const PlanningOwnerId owner{.value = next_projected_owner++};
             projected_owners.push_back(ContextPortfolioOwnerPolicy{
                 .owner                    = owner,
-                .private_retention_weight = private_retention_weight(entry.retention),
+                .private_retention_weight = effective_private_retention_weight(entry),
             });
             if (entry.summary.endpoint) {
                 append_existing(owner, *entry.handle, *entry.summary.endpoint, entry.session);
@@ -2843,7 +2917,7 @@ private:
                     .retention_class          = entry.retention,
                     .selected_hit_count       = selected_hits,
                     .last_hit_epoch           = owner_recency_epoch(entry),
-                    .private_retention_weight = private_retention_weight(entry.retention),
+                    .private_retention_weight = effective_private_retention_weight(entry),
                 });
             }
             for (std::uint32_t slot = 0; slot < shared_catalog_count_; ++slot) {
@@ -3079,6 +3153,26 @@ private:
                 });
             }
         }
+        const auto append_victim = [&](const OwnerClaim& claim, bool shared) {
+            if (choice.diagnostics_.selected_victims.size() >= kMaximumMaterializationVictims) {
+                return;
+            }
+            MaterializationVictimDiagnostics victim;
+            victim.owner = shared ? shared_owner_diagnostics(program, claim.capability.slot)
+                                  : private_owner_diagnostics(program, claim.capability.slot);
+            victim.outcome =
+                claim.disposition == VictimDisposition::Evicted ? "Evicted" : "Retained";
+            for (const CheckpointRef checkpoint : claim.dropped_checkpoints) {
+                victim.dropped_checkpoints.push_back(ContextCacheCheckpointDiagnostics{
+                    .kind            = checkpoint_kind_name(checkpoint.kind),
+                    .frontier_tokens = checkpoint.frontier,
+                    .ordinal         = checkpoint.ordinal,
+                });
+            }
+            choice.diagnostics_.selected_victims.push_back(std::move(victim));
+        };
+        for (const OwnerClaim& claim : choice.private_claims_) { append_victim(claim, false); }
+        for (const OwnerClaim& claim : choice.shared_claims_) { append_victim(claim, true); }
         return choice;
     }
 
@@ -3272,6 +3366,20 @@ private:
     }
 
     void observe_selected_hit(const MaterializationRecord& record) noexcept {
+        if (record.private_source && record.private_source->slot < catalog_count_) {
+            CatalogEntry& source = catalog_[record.private_source->slot];
+            if (source.id == record.private_source->owner.id) {
+                source.last_touch_demand_epoch = demand_epoch_;
+                saturating_increment(source.last_touch_demand_epoch);
+            }
+        }
+        if (record.shared_source && record.shared_source->slot < shared_catalog_count_) {
+            SharedCatalogEntry& source = shared_catalog_[record.shared_source->slot];
+            if (source.id == record.shared_source->owner.id) {
+                source.last_touch_demand_epoch = demand_epoch_;
+                saturating_increment(source.last_touch_demand_epoch);
+            }
+        }
         if (record.selected_observation) {
             RetentionObservation* selected = resolve_observation(*record.selected_observation);
             if (selected) {
@@ -3840,19 +3948,12 @@ private:
         }
 
         if (published) { observe_selected_hit(*record); }
-        bool admitted_under_pressure = false;
         for (const OwnerClaim& claim : record->private_claims) {
             const auto& victim = private_result_for(claim);
-            admitted_under_pressure =
-                admitted_under_pressure ||
-                (claim.capability.slot != record->publication_slot &&
-                 (victim.pressure_committed || victim.disposition == VictimDisposition::Evicted));
             apply_private_action(claim, published, victim);
         }
         for (const OwnerClaim& claim : record->shared_claims) {
-            const auto& victim      = shared_result_for(claim);
-            admitted_under_pressure = admitted_under_pressure || victim.pressure_committed ||
-                                      victim.disposition == VictimDisposition::Evicted;
+            const auto& victim = shared_result_for(claim);
             apply_shared_action(claim, published, victim);
         }
 
@@ -3933,9 +4034,8 @@ private:
             active.shared_sources.push_back(
                 active_edge(shared_capability(record->shared_source->slot)));
         }
-        active.admitted_under_pressure = admitted_under_pressure;
-        active.extended_resident_keys  = record->demand.exact_resident_keys;
-        StartResult start              = std::move(*result.published);
+        active.extended_resident_keys = record->demand.exact_resident_keys;
+        StartResult start             = std::move(*result.published);
         result.published.reset();
         commit_demand(std::move(record->demand));
         return MaterializationOutcome{
@@ -4112,6 +4212,7 @@ private:
             publication.summary                   = result.shared->summary;
             publication.summary.active_references = 0;
             publication.handle.emplace(std::move(result.shared->handle));
+            publication.last_touch_demand_epoch = demand_epoch_;
             publication.observation =
                 RetentionObservation{.retention_class = RetentionClass::SharedStable};
             publication.last_touch_epoch = ++retention_epoch_;
@@ -4295,6 +4396,16 @@ private:
             std::min(publication.last_touch_epoch, superseding == 0 ? 0 : superseding - 1U);
     }
 
+    static void demote_completed_lineage(CatalogEntry& entry) noexcept {
+        entry.session.reset();
+        entry.retention               = RetentionClass::Disposable;
+        entry.last_touch_demand_epoch = 0;
+        for (CheckpointObservation& observation : entry.observations) {
+            observation.observation.retention_class = RetentionClass::Disposable;
+            observation.observation.last_hit_epoch  = 0;
+        }
+    }
+
     void demote_replaced_session(const SessionIndexEntry& previous, std::uint32_t replacement_slot,
                                  std::uint64_t replacement_id) noexcept {
         if (previous.slot >= catalog_count_ ||
@@ -4306,11 +4417,7 @@ private:
             prior.id != previous.owner_id || prior.revision != previous.revision) {
             return;
         }
-        prior.session.reset();
-        prior.retention = RetentionClass::RecentPrivate;
-        for (CheckpointObservation& observation : prior.observations) {
-            observation.observation.retention_class = RetentionClass::RecentPrivate;
-        }
+        demote_completed_lineage(prior);
     }
 
     void observe_transfer(const ContextTransferObservation& observation) noexcept {
@@ -4421,6 +4528,12 @@ private:
     using ContextTransaction =
         std::variant<std::monostate, MaterializationRecord, ActiveCaptureRecord>;
     ContextTransaction transaction_;
+    // Global Program revision covers shared replicas whose movement need not revise every owner.
+    // Ordinary decode inside active entitlement leaves inactive topology unchanged.
+    mutable bool catalog_diagnostics_cached_ = false;
+    mutable ProgramResourceRevision catalog_diagnostics_revision_{};
+    mutable std::uint64_t catalog_diagnostics_epoch_ = 0;
+    mutable std::vector<ContextCacheOwnerDiagnostics> catalog_diagnostics_cache_;
     ContextMachineCostModel cost_model_;
     Planner planner_;
     CapturePlanner capture_planner_;

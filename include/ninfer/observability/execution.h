@@ -8,6 +8,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <optional>
+#include <string>
 #include <vector>
 
 namespace ninfer {
@@ -166,6 +167,80 @@ materialization_search_phase_name(MaterializationSearchPhase phase) noexcept {
     return "none";
 }
 
+inline constexpr std::size_t kMaximumMaterializationCandidates    = 8;
+inline constexpr std::size_t kMaximumMaterializationVictims       = 16;
+inline constexpr std::size_t kMaximumMaterializationRejectedPlans = 3;
+inline constexpr std::size_t kMaximumContextCacheCatalogOwners    = 16;
+
+struct MaterializationCandidateDiagnostics {
+    std::uint32_t candidate_id   = 0;
+    PrefixReusePath kind         = PrefixReusePath::Root;
+    std::uint32_t matched_tokens = 0;
+    std::string physical_status;
+    bool expandable = false;
+    std::string source_mode;
+    std::string retention_reason;
+    std::uint64_t lower_bound_ns = 0;
+
+    [[nodiscard]] friend bool operator==(const MaterializationCandidateDiagnostics&,
+                                         const MaterializationCandidateDiagnostics&) = default;
+};
+
+struct MaterializationRejectedPlanDiagnostics {
+    std::uint32_t candidate_id = 0;
+    // Identity projections have no pressure target ordinal.
+    std::optional<std::uint32_t> target_ordinal;
+    PrefixReusePath kind         = PrefixReusePath::Root;
+    std::uint32_t matched_tokens = 0;
+    std::string source_mode;
+    std::uint64_t now_ns         = 0;
+    std::uint64_t future_loss_ns = 0;
+    std::uint64_t total_ns       = 0;
+
+    [[nodiscard]] friend bool operator==(const MaterializationRejectedPlanDiagnostics&,
+                                         const MaterializationRejectedPlanDiagnostics&) = default;
+};
+
+struct ContextCacheCheckpointDiagnostics {
+    std::string kind;
+    std::uint32_t frontier_tokens = 0;
+    std::uint32_t ordinal         = 0;
+
+    [[nodiscard]] friend bool operator==(const ContextCacheCheckpointDiagnostics&,
+                                         const ContextCacheCheckpointDiagnostics&) = default;
+};
+
+struct ContextCacheOwnerDiagnostics {
+    std::string kind;
+    std::uint64_t owner_id   = 0;
+    std::uint32_t slot       = 0;
+    std::uint64_t generation = 0;
+    std::string session_key;
+    std::string retention;
+    std::uint32_t effective_weight = 0;
+    std::uint64_t age              = 0;
+    std::uint32_t frontier_tokens  = 0;
+    std::uint64_t rebuild_ns       = 0;
+    // Unreported physical placement remains unknown, never inferred from transfer costs.
+    std::optional<std::uint32_t> device_state_slots;
+    std::optional<std::uint32_t> host_state_slots;
+    std::optional<std::uint32_t> device_kv_pages;
+    std::optional<std::uint32_t> host_kv_pages;
+    std::optional<std::uint32_t> disk_kv_pages;
+
+    [[nodiscard]] friend bool operator==(const ContextCacheOwnerDiagnostics&,
+                                         const ContextCacheOwnerDiagnostics&) = default;
+};
+
+struct MaterializationVictimDiagnostics {
+    ContextCacheOwnerDiagnostics owner;
+    std::string outcome;
+    std::vector<ContextCacheCheckpointDiagnostics> dropped_checkpoints;
+
+    [[nodiscard]] friend bool operator==(const MaterializationVictimDiagnostics&,
+                                         const MaterializationVictimDiagnostics&) = default;
+};
+
 struct MaterializationDiagnostics {
     std::uint64_t predicted_now_ns           = 0;
     std::uint64_t predicted_future_loss_ns   = 0;
@@ -202,9 +277,12 @@ struct MaterializationDiagnostics {
     std::uint32_t cached_prefix_tokens = 0;
     std::uint64_t restored_host_bytes  = 0;
 
-    [[nodiscard]] friend constexpr bool
-    operator==(const MaterializationDiagnostics&,
-               const MaterializationDiagnostics&) noexcept = default;
+    std::vector<MaterializationCandidateDiagnostics> candidates;
+    std::vector<MaterializationVictimDiagnostics> selected_victims;
+    std::vector<MaterializationRejectedPlanDiagnostics> best_rejected;
+
+    [[nodiscard]] friend bool operator==(const MaterializationDiagnostics&,
+                                         const MaterializationDiagnostics&) noexcept = default;
 };
 
 struct NgramArchiveStats {

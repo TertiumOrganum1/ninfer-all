@@ -3,6 +3,7 @@
 #include "ninfer/engine.h"
 #include "runtime/engine/worker_fault.h"
 
+#include <algorithm>
 #include <chrono>
 #include <array>
 #include <atomic>
@@ -51,20 +52,20 @@ ninfer::EngineOptions engine_options(const char* artifact) {
 
 ninfer::EngineOptions host_restore_engine_options(const char* artifact) {
     ninfer::EngineOptions options;
-    options.artifact_path                        = artifact;
-    options.max_context                          = 512;
-    options.kv_capacity                          = ninfer::KvCapacityPolicy::explicit_capacity(512);
-    options.prefill_chunk                        = 256;
-    options.speculative.backend                  = ninfer::SpeculativeBackend::Mtp;
-    options.speculative.draft_tokens             = 3;
-    options.speculative.proposal_head            = ninfer::ProposalHead::Optimized;
-    options.max_concurrency                      = 1;
-    options.max_pending_requests                 = 1;
+    options.artifact_path             = artifact;
+    options.max_context               = 512;
+    options.kv_capacity               = ninfer::KvCapacityPolicy::explicit_capacity(512);
+    options.prefill_chunk             = 256;
+    options.speculative.backend       = ninfer::SpeculativeBackend::Mtp;
+    options.speculative.draft_tokens  = 3;
+    options.speculative.proposal_head = ninfer::ProposalHead::Optimized;
+    options.max_concurrency           = 1;
+    options.max_pending_requests      = 1;
     // This fixture asserts a complete Host restore. Extra Device checkpoint slots can leave the
     // selected endpoint resident and turn the pressure request into a different valid scenario.
-    options.context_cache.device_state_slots     = 0;
-    options.context_cache.host_state_slots       = 2;
-    options.context_cache.host_kv_capacity_bytes = 256ULL << 20;
+    options.context_cache.device_state_slots                = 0;
+    options.context_cache.host_state_slots                  = 2;
+    options.context_cache.host_kv_capacity_bytes            = 256ULL << 20;
     options.context_cache.max_private_continuations         = 2;
     options.context_cache.max_shared_prefixes               = 0;
     options.context_cache.max_long_anchors_per_continuation = 0;
@@ -321,8 +322,7 @@ struct RegisteredFrontendGoldens {
     ninfer::PrefixReusePath host_restore_path;
 };
 
-std::optional<RegisteredFrontendGoldens> registered_frontend_goldens(
-    std::string_view model_name) {
+std::optional<RegisteredFrontendGoldens> registered_frontend_goldens(std::string_view model_name) {
     if (model_name == "qwen3.6-27b") {
         return RegisteredFrontendGoldens{16, 18, ninfer::PrefixReusePath::PrivateTurnClosure};
     }
@@ -416,8 +416,8 @@ int exercise_registered_frontend(const ninfer::Engine& engine) {
     const auto model_name         = engine.load_summary().model_name;
     const auto goldens            = registered_frontend_goldens(model_name);
     if (!goldens) {
-        std::cerr << "registered tokenizer/chat template has no prompt golden: model="
-                  << model_name << '\n';
+        std::cerr << "registered tokenizer/chat template has no prompt golden: model=" << model_name
+                  << '\n';
         return 1;
     }
     if (thinking_tokens != goldens->thinking_tokens ||
@@ -3430,10 +3430,12 @@ int exercise_pressure_partial_spill_and_resume(const char* artifact) {
     }
 
     const ninfer::RuntimeStats before_pressure = engine.runtime_stats();
+    // Keep this request uncached so the counters isolate admission pressure and the later
+    // restoration of the retained closure rather than optional checkpoint publication.
     const ninfer::GenerationResult short_b =
         engine.generate(engine.prepare(pressure_turn(*short_b_text, "pressure-short-b",
                                                      ninfer::CacheRetentionHint::LiveSession)),
-                        fixed_output(1));
+                        fixed_output(1, false));
     const ninfer::RuntimeStats after_pressure = engine.runtime_stats();
     const std::uint64_t pressure_main_pages =
         after_pressure.main_kv_d2h_pages - before_pressure.main_kv_d2h_pages;

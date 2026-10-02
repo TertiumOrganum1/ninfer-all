@@ -181,6 +181,87 @@ public:
         identity_costs_.clear();
         target_ledger_.reset(candidates.size() + 1U + kTargetBudget);
 
+        std::vector<MaterializationCandidateDiagnostics> candidate_diagnostics;
+        candidate_diagnostics.reserve(
+            std::min(candidates.size(), kMaximumMaterializationCandidates));
+
+        struct EvaluatedPlan {
+            FoldedCost cost;
+            MaterializationRejectedPlanDiagnostics diagnostics;
+        };
+
+        // The selected plan can occupy one row; keep one extra until the winner is known.
+        std::vector<EvaluatedPlan> evaluated_plans;
+        evaluated_plans.reserve(kMaximumMaterializationRejectedPlans + 1);
+        const auto record_feasible = [&](std::uint32_t index, std::optional<std::uint32_t> ordinal,
+                                         PrivateSourceMode source_mode, const FoldedCost& cost) {
+            const auto& input = candidates[index];
+            if (std::any_of(evaluated_plans.begin(), evaluated_plans.end(), [&](const auto& plan) {
+                    return plan.diagnostics.candidate_id == input.id.value &&
+                           plan.diagnostics.target_ordinal == ordinal;
+                })) {
+                return;
+            }
+            const auto position =
+                std::find_if(evaluated_plans.begin(), evaluated_plans.end(),
+                             [&](const auto& plan) { return cost.less(plan.cost); });
+            if (position == evaluated_plans.end() &&
+                evaluated_plans.size() == kMaximumMaterializationRejectedPlans + 1) {
+                return;
+            }
+            const auto& summary = input.candidate->summary();
+            evaluated_plans.insert(
+                position, EvaluatedPlan{
+                              .cost        = cost,
+                              .diagnostics = {.candidate_id   = input.id.value,
+                                              .target_ordinal = ordinal,
+                                              .kind           = summary.prefix_reuse_path,
+                                              .matched_tokens = summary.reusable_prompt_tokens,
+                                              .source_mode    = source_mode_name(source_mode),
+                                              .now_ns         = cost.now_ns,
+                                              .future_loss_ns = cost.future_loss_ns,
+                                              .total_ns       = cost.total_ns},
+                          });
+            if (evaluated_plans.size() > kMaximumMaterializationRejectedPlans + 1) {
+                evaluated_plans.pop_back();
+            }
+        };
+        const auto describe_candidate = [&](std::uint32_t index, const FoldedCost& cost) {
+            const auto& input    = candidates[index];
+            const auto& summary  = input.candidate->summary();
+            const auto& identity = input.candidate->identity_assessment();
+            return MaterializationCandidateDiagnostics{
+                .candidate_id    = input.id.value,
+                .kind            = summary.prefix_reuse_path,
+                .matched_tokens  = summary.reusable_prompt_tokens,
+                .physical_status = physical_status_name(identity.physical_status),
+                .expandable      = identity.expandable,
+                .source_mode     = source_mode_name(identity.source_mode),
+                .retention_reason =
+                    private_source_retention_reason_name(identity.source_retention_reason),
+                .lower_bound_ns = cost.lower_bound_ns,
+            };
+        };
+        const auto attach_fact_diagnostics = [&](MaterializationDiagnostics& diagnostics,
+                                                 const Incumbent& selected) {
+            if (selected.candidate_index >= candidate_diagnostics.size()) {
+                candidate_diagnostics.back() = describe_candidate(
+                    selected.candidate_index, identity_costs_[selected.candidate_index]);
+            }
+            diagnostics.candidates = std::move(candidate_diagnostics);
+            for (auto& plan : evaluated_plans) {
+                if (plan.diagnostics.candidate_id ==
+                        candidates[selected.candidate_index].id.value &&
+                    plan.diagnostics.target_ordinal == selected.diagnostic_target_ordinal) {
+                    continue;
+                }
+                if (diagnostics.best_rejected.size() == kMaximumMaterializationRejectedPlans) {
+                    break;
+                }
+                diagnostics.best_rejected.push_back(std::move(plan.diagnostics));
+            }
+        };
+
         // The mandatory root-maximal fallback does not count as an ordinary feasible seed.
         std::vector<bool> candidate_seeded(candidates.size(), false);
         std::optional<Incumbent> identity_best;
@@ -202,10 +283,18 @@ public:
                   static_cast<unsigned long long>(cost.remaining_text_prefill),
                   cost.reused_prompt_tokens,
                   static_cast<unsigned long long>(cost.transferred_bytes));
+            if (candidate_diagnostics.size() < kMaximumMaterializationCandidates) {
+                candidate_diagnostics.push_back(
+                    describe_candidate(static_cast<std::uint32_t>(index), cost));
+            }
             std::optional<LogicalGoal> goal;
             if (identity.physical_status == MaterializationPhysicalStatus::Feasible) {
                 goal = logical_goal(input.id, identity.source_mode,
                                     std::span<const PressureOwnerOutcome>{});
+            }
+            if (goal) {
+                record_feasible(static_cast<std::uint32_t>(index), std::nullopt,
+                                identity.source_mode, cost);
             }
             if (goal && (!identity_best || cost.less(identity_best->cost))) {
                 identity_best = Incumbent{
@@ -275,12 +364,13 @@ public:
                     : time_exhausted       ? MaterializationStopReason::TimeBudget
                                            : MaterializationStopReason::InsufficientExpectedGain,
                     false);
-                diagnostics.budget_exhausted  = needs_optional_search && time_exhausted;
-                diagnostics.search_stop_phase = needs_optional_search
-                                                    ? MaterializationSearchPhase::Setup
-                                                    : MaterializationSearchPhase::None;
+                diagnostics.budget_exhausted        = needs_optional_search && time_exhausted;
+                diagnostics.search_stop_phase       = needs_optional_search
+                                                          ? MaterializationSearchPhase::Setup
+                                                          : MaterializationSearchPhase::None;
                 diagnostics.search_boundary_limited = needs_optional_search && time_exhausted;
                 diagnostics.best_reuse_prompt_tokens = best_offered_reuse(candidates);
+                attach_fact_diagnostics(diagnostics, *identity_best);
                 Result result;
                 result.plan             = std::move(*sealed);
                 result.candidate        = candidates[identity_best->candidate_index].id;
@@ -464,6 +554,8 @@ public:
             const FoldedCost cost =
                 fold_assessment(candidates[root_candidate_index], assessment, pressure.owner_policy,
                                 pressure.checkpoint_policy, machine_cost);
+            record_feasible(root_candidate_index, assessment.stable_target_ordinal,
+                            assessment.source_mode, cost);
             incumbent = make_incumbent(escape, root_candidate_index, assessment,
                                        std::move(*assessed), cost, *goal);
             mark_target(assessment.stable_target_ordinal, kTargetDiscovered | kTargetAssessed);
@@ -593,6 +685,8 @@ public:
             if (goal) {
                 mark_target(assessment.stable_target_ordinal, kTargetFeasible);
                 candidate_seeded[expected_candidate] = true;
+                record_feasible(expected_candidate, assessment.stable_target_ordinal,
+                                assessment.source_mode, cost);
             }
             const bool becomes_incumbent = goal && cost.less(incumbent.cost);
             trace(
@@ -633,8 +727,8 @@ public:
             // Near the target budget a full eight-owner batch can overflow while a smaller one
             // still fits; discarding leaves the parent's expansion cursor unchanged, so halve and
             // retry before declaring the expansion capacity spent.
-            using Committed = decltype(
-                session.commit_expansion(session.prepare_expansion(parent.target, 1)));
+            using Committed =
+                decltype(session.commit_expansion(session.prepare_expansion(parent.target, 1)));
             std::optional<Committed> committed;
             for (std::uint32_t owners = 8; !committed; owners /= 2) {
                 auto prepared = session.prepare_expansion(parent.target, owners);
@@ -1045,6 +1139,7 @@ public:
         diagnostics.search_overshoot_ns        = search_elapsed_ns > search_budget.granted_ns()
                                                      ? search_elapsed_ns - search_budget.granted_ns()
                                                      : 0;
+        attach_fact_diagnostics(diagnostics, incumbent);
         Result result;
         result.plan                = std::move(*sealed);
         result.candidate           = candidates[incumbent.candidate_index].id;
@@ -1072,6 +1167,23 @@ public:
     }
 
 private:
+    [[nodiscard]] static constexpr const char* source_mode_name(PrivateSourceMode mode) noexcept {
+        return mode == PrivateSourceMode::Retain ? "retain" : "consume_to_active";
+    }
+
+    [[nodiscard]] static constexpr const char*
+    physical_status_name(MaterializationPhysicalStatus status) noexcept {
+        switch (status) {
+        case MaterializationPhysicalStatus::Feasible:
+            return "feasible";
+        case MaterializationPhysicalStatus::Infeasible:
+            return "infeasible";
+        case MaterializationPhysicalStatus::StructuralInvalid:
+            return "structural_invalid";
+        }
+        return "structural_invalid";
+    }
+
     static constexpr std::uint32_t kTargetBudget = 4096;
 
     struct FoldedCost {
@@ -1118,6 +1230,7 @@ private:
     struct Incumbent {
         PressureTargetHandle target{};
         std::optional<AssessedPressureTarget> assessed;
+        std::optional<std::uint32_t> diagnostic_target_ordinal;
         std::uint32_t candidate_index  = 0;
         std::uint32_t publication_slot = std::numeric_limits<std::uint32_t>::max();
         PrivateSourceMode source_mode  = PrivateSourceMode::ConsumeToActive;
@@ -1513,14 +1626,15 @@ private:
                                                   AssessedPressureTarget&& assessed,
                                                   FoldedCost cost, LogicalGoal goal) {
         return Incumbent{
-            .target           = target,
-            .assessed         = std::move(assessed),
-            .candidate_index  = candidate_index,
-            .publication_slot = goal.publication_slot,
-            .source_mode      = assessment.source_mode,
-            .cost             = std::move(cost),
-            .owner_outcomes   = std::vector<PressureOwnerOutcome>(assessment.owner_outcomes.begin(),
-                                                                  assessment.owner_outcomes.end()),
+            .target                    = target,
+            .assessed                  = std::move(assessed),
+            .diagnostic_target_ordinal = assessment.stable_target_ordinal,
+            .candidate_index           = candidate_index,
+            .publication_slot          = goal.publication_slot,
+            .source_mode               = assessment.source_mode,
+            .cost                      = std::move(cost),
+            .owner_outcomes = std::vector<PressureOwnerOutcome>(assessment.owner_outcomes.begin(),
+                                                                assessment.owner_outcomes.end()),
             .checkpoint_outcomes =
                 [&] {
                     std::vector<PressureCheckpointOutcome> outcomes;

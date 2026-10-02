@@ -684,12 +684,18 @@ std::optional<AdmissionCandidate> ProgramImpl::inspect_lane(
             plan->reuse_base  = selected.frontier;
             plan->source_mode = runtime::PrivateSourceMode::Retain;
         }
+        plan->identity_assessment.source_retention_reason =
+            runtime::PrivateSourceRetentionReason::SharedSource;
     } else if (source != nullptr) {
         const runtime::CheckpointRef selected = *checkpoint;
         plan->selected_checkpoint             = selected;
         plan->source_mode                     = must_retain_private_source
-                                                     ? runtime::PrivateSourceMode::Retain
-                                                     : runtime::PrivateSourceMode::ConsumeToActive;
+                                                    ? runtime::PrivateSourceMode::Retain
+                                                    : runtime::PrivateSourceMode::ConsumeToActive;
+        if (must_retain_private_source) {
+            plan->identity_assessment.source_retention_reason =
+                runtime::PrivateSourceRetentionReason::SessionOwnership;
+        }
         if (!base.allow_prefix_reuse || !prompt.identity.reusable) { return std::nullopt; }
         if (selected.kind == runtime::CheckpointKind::SessionEndpoint) {
             if (selected.ordinal != 0) {
@@ -818,6 +824,8 @@ std::optional<AdmissionCandidate> ProgramImpl::inspect_lane(
         if (std::find(optional_states.begin(), optional_states.end(), endpoint) !=
             optional_states.end()) {
             plan->source_mode = runtime::PrivateSourceMode::Retain;
+            plan->identity_assessment.source_retention_reason =
+                runtime::PrivateSourceRetentionReason::EndpointAlias;
         } else {
             std::vector<StateImageHandle> unique;
             unique.reserve(optional_states.size());
@@ -842,8 +850,7 @@ std::optional<AdmissionCandidate> ProgramImpl::inspect_lane(
             }
         }
     }
-    if (source != nullptr &&
-        plan->source_mode == runtime::PrivateSourceMode::ConsumeToActive) {
+    if (source != nullptr && plan->source_mode == runtime::PrivateSourceMode::ConsumeToActive) {
         plan->state_fork_required =
             selected_state_requires_fork(*source, plan->reuse, plan->rewrite_disposition,
                                          plan->selected_checkpoint, plan->reuse_base);
@@ -1075,8 +1082,7 @@ std::optional<AdmissionCandidate> ProgramImpl::inspect_lane(
         const bool splits_private_both =
             source != nullptr && selected_state_residency == StateReplicaResidency::Both;
         const bool forks_device_state =
-            (plan->source_mode == runtime::PrivateSourceMode::Retain &&
-             !splits_private_both) ||
+            (plan->source_mode == runtime::PrivateSourceMode::Retain && !splits_private_both) ||
             (plan->source_mode == runtime::PrivateSourceMode::ConsumeToActive &&
              plan->state_fork_required);
         if (is_masked_draft_backend(speculative_backend) && forks_device_state &&

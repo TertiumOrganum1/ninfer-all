@@ -3,6 +3,7 @@
 // Engine snapshots: runtime statistics, context cost, model metadata and residency, slot state
 // and the load summary.
 
+#include "ninfer/observability/execution.h"
 #include "ninfer/observability/resources.h"
 
 #include <array>
@@ -56,6 +57,7 @@ struct ResidencyStatus {
 // Monotonic execution counters, boundary-consistent current gauges, and explicitly named last
 // decision observations. Consumers derive interval counters by subtracting two snapshots.
 struct RuntimeStats {
+    std::vector<ContextCacheOwnerDiagnostics> context_cache_catalog;
     RuntimeHostWorkStats host_work;
     // Actual prompt tokens evaluated by prefill; reused checkpoint-prefix tokens are excluded.
     std::uint64_t computed_prefill_tokens = 0;

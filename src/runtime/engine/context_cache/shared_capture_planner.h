@@ -61,12 +61,13 @@ public:
         // first.
         std::span<const PlanningOwnerId> recency_owner_ids;
         std::optional<PlanningOwnerId> direct_shared_victim;
-        std::uint64_t candidate_demand_mask         = 0;
-        std::uint64_t candidate_rebuild_ns          = 0;
-        std::uint64_t private_baseline_immediate_ns = 0;
-        std::uint32_t blocked_runnable_requests     = 0;
-        std::uint32_t stable_scenario_ordinal       = 0;
-        std::uint32_t target_budget                 = kTargetBudget;
+        std::uint64_t candidate_demand_mask              = 0;
+        std::uint64_t candidate_rebuild_ns               = 0;
+        std::uint32_t candidate_private_retention_weight = 0;
+        std::uint64_t private_baseline_immediate_ns      = 0;
+        std::uint32_t blocked_runnable_requests          = 0;
+        std::uint32_t stable_scenario_ordinal            = 0;
+        std::uint32_t target_budget                      = kTargetBudget;
     };
 
     struct Result {
@@ -334,10 +335,11 @@ private:
         }
         const PlanningOwnerId candidate_owner = next_candidate_owner(input.owner_policies);
         const bool candidate_credit =
-            has_shared_candidate_evidence(input.capture->shared_evidence,
-                                          SharedCandidateEvidence::ExplicitBoundary) ||
-            has_shared_candidate_evidence(input.capture->shared_evidence,
-                                          SharedCandidateEvidence::RequestedAutomatic);
+            input.capture->publishes_shared &&
+            (has_shared_candidate_evidence(input.capture->shared_evidence,
+                                           SharedCandidateEvidence::ExplicitBoundary) ||
+             has_shared_candidate_evidence(input.capture->shared_evidence,
+                                           SharedCandidateEvidence::RequestedAutomatic));
         owner_scratch_.push_back(ContextPortfolioOwnerPolicy{
             .owner                    = candidate_owner,
             .private_retention_weight = 0,
@@ -400,13 +402,28 @@ private:
         };
         add_threshold(portfolio.private_transition_loss);
         add_threshold(immediate);
-        const bool positive = !saturated && portfolio.target_public_value > threshold;
+        const std::uint64_t candidate_recovery =
+            price_checkpoint_recovery_work(machine_cost, input.capture->projected_recovery_work);
+        const std::uint64_t candidate_saving = input.candidate_rebuild_ns > candidate_recovery
+                                                   ? input.candidate_rebuild_ns - candidate_recovery
+                                                   : 0;
+        const std::uint64_t private_gain =
+            saturating_multiply(candidate_saving, input.candidate_private_retention_weight);
+        std::uint64_t target_value = portfolio.target_public_value;
+        if (private_gain == std::numeric_limits<std::uint64_t>::max() ||
+            private_gain > std::numeric_limits<std::uint64_t>::max() - target_value) {
+            target_value = std::numeric_limits<std::uint64_t>::max();
+            saturated    = true;
+        } else {
+            target_value += private_gain;
+        }
+        const bool positive = !saturated && target_value > threshold;
         return TransitionValue{
             .baseline_public = portfolio.baseline_public_value,
-            .target_public   = portfolio.target_public_value,
+            .target_public   = target_value,
             .private_loss    = portfolio.private_transition_loss,
             .immediate       = immediate,
-            .gain            = positive ? portfolio.target_public_value - threshold : 0,
+            .gain            = positive ? target_value - threshold : 0,
             .positive        = positive,
             .saturated       = saturated,
         };

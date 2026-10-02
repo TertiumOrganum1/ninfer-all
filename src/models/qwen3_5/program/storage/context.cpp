@@ -10,6 +10,7 @@
 #include <optional>
 #include <span>
 #include <stdexcept>
+#include <unordered_set>
 #include <utility>
 #include <variant>
 
@@ -44,6 +45,98 @@ bool ProgramImpl::valid_shared_prefix(const SharedPrefixHandle& handle) const no
     return index < shared_prefix_capacity &&
            ContractAccess::epoch(handle) == shared_prefix_slots[index].generation &&
            is_live_shared_prefix_role(shared_prefix_slots[index].role);
+}
+
+namespace {
+
+ContextCacheOwnerDiagnostics owner_replica_diagnostics(
+    const StateImageStore& states, std::span<const StateImageHandle> state_handles,
+    const SequenceKVBundle& bundle, const KVAddressSpaceStore& main_addresses,
+    const LogicalKVPageStore& main_pages, const KVAddressSpaceStore* backend_addresses,
+    const LogicalKVPageStore* backend_pages, bool has_disk_tier) {
+    ContextCacheOwnerDiagnostics out;
+    out.device_state_slots = 0;
+    out.host_state_slots   = 0;
+    out.device_kv_pages    = 0;
+    out.host_kv_pages      = 0;
+    // Disk pages are indexed by persistent prefix identity, not attached to live logical page
+    // handles. An enabled tier therefore needs a separate identity-aware inventory to report
+    // owner backups; absence of a tier is the only known zero here.
+    if (!has_disk_tier) { out.disk_kv_pages = 0; }
+    std::unordered_set<std::uint32_t> seen_states;
+    for (const StateImageHandle handle : state_handles) {
+        if (!seen_states.insert(states.descriptor_index(handle)).second) { continue; }
+        const StateReplicaResidency residency = states.residency(handle);
+        if (residency == StateReplicaResidency::DeviceOnly ||
+            residency == StateReplicaResidency::Both) {
+            ++*out.device_state_slots;
+        }
+        if (residency == StateReplicaResidency::HostOnly ||
+            residency == StateReplicaResidency::Both) {
+            ++*out.host_state_slots;
+        }
+    }
+    const auto add_pages = [&](const KVAddressSpaceStore& addresses,
+                               const LogicalKVPageStore& pages, KVAddressSpaceHandle address) {
+        std::unordered_set<std::uint32_t> seen_pages;
+        const std::uint32_t mapped = addresses.mapped_pages(address);
+        seen_pages.reserve(mapped);
+        for (std::uint32_t index = 0; index < mapped; ++index) {
+            const LogicalKVPageHandle page = addresses.logical_page(address, index);
+            if (!seen_pages.insert(pages.descriptor_index(page)).second) { continue; }
+            if (pages.device_resident(page)) { ++*out.device_kv_pages; }
+            if (pages.host_resident(page)) { ++*out.host_kv_pages; }
+        }
+    };
+    add_pages(main_addresses, main_pages, bundle.text);
+    if (bundle.backend) {
+        if (backend_addresses == nullptr || backend_pages == nullptr) {
+            throw std::logic_error("owner backend KV has no physical store");
+        }
+        // Descriptor indices belong to typed pools, so deduplicate each pool independently.
+        add_pages(*backend_addresses, *backend_pages, *bundle.backend);
+    }
+    return out;
+}
+
+} // namespace
+
+ContextCacheOwnerDiagnostics
+ProgramImpl::context_cache_owner_diagnostics(const ContinuationHandle& owner) const {
+    if (!valid_continuation(owner)) {
+        throw std::logic_error("context diagnostics continuation is stale");
+    }
+    const SequenceState& sequence = continuation_states[ContractAccess::index(owner)];
+    if (!sequence.kv || !state_store || !text_kv_addresses || !text_kv_pages) {
+        throw std::logic_error("context diagnostics continuation has no physical stores");
+    }
+    std::vector<StateImageHandle> states;
+    states.reserve(2U + sequence.long_anchors.size());
+    if (sequence.endpoint_valid) { states.push_back(sequence.state.read); }
+    if (sequence.rewrite_checkpoint.valid && sequence.rewrite_state) {
+        states.push_back(*sequence.rewrite_state);
+    }
+    for (const LongAnchorCheckpoint& anchor : sequence.long_anchors) {
+        states.push_back(anchor.state);
+    }
+    return owner_replica_diagnostics(*state_store, states, *sequence.kv, *text_kv_addresses,
+                                     *text_kv_pages, backend_kv_addresses.get(),
+                                     backend_kv_pages.get(), disk_kv != nullptr);
+}
+
+ContextCacheOwnerDiagnostics
+ProgramImpl::context_cache_owner_diagnostics(const SharedPrefixHandle& owner) const {
+    if (!valid_shared_prefix(owner)) {
+        throw std::logic_error("context diagnostics shared prefix is stale");
+    }
+    const SharedPrefixState& shared = shared_prefix_states[ContractAccess::index(owner)];
+    if (!shared.kv || !state_store || !text_kv_addresses || !text_kv_pages) {
+        throw std::logic_error("context diagnostics shared prefix has no physical stores");
+    }
+    const std::array states{shared.state};
+    return owner_replica_diagnostics(*state_store, states, *shared.kv, *text_kv_addresses,
+                                     *text_kv_pages, backend_kv_addresses.get(),
+                                     backend_kv_pages.get(), disk_kv != nullptr);
 }
 
 bool ProgramImpl::valid_capture_offer(const CaptureOffer& offer) const noexcept {
@@ -1231,7 +1324,8 @@ void ProgramImpl::reserve_state_entitlement(SequenceState& sequence, std::uint32
     }
     std::optional<StateImageHandle> reserved = state_store->reserve_destination();
     if (!reserved) {
-        throw ninfer::ContextCacheExhausted("Device StateImage store has no free slot for the sequence reservation");
+        throw ninfer::ContextCacheExhausted(
+            "Device StateImage store has no free slot for the sequence reservation");
     }
     sequence.reserved_state = *reserved;
     if (sequence_exclusive_state_resources(sequence).device.state_slots != slots) {

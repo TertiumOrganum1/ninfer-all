@@ -1284,6 +1284,12 @@ public:
     [[nodiscard]] std::optional<HybridCachePersistence> hybrid_shutdown_save() const;
 
     [[nodiscard]] runtime::ProgramResourceRevision resource_revision() const noexcept;
+    // Counts each replica referenced by this owner once, including allocations shared with other
+    // owners. Counts from different owners are not additive physical occupancy.
+    [[nodiscard]] ContextCacheOwnerDiagnostics
+    context_cache_owner_diagnostics(const ContinuationHandle& owner) const;
+    [[nodiscard]] ContextCacheOwnerDiagnostics
+    context_cache_owner_diagnostics(const SharedPrefixHandle& owner) const;
     [[nodiscard]] PhysicalUsageSnapshot physical_usage() const noexcept;
     [[nodiscard]] MemorySummary memory_summary() const noexcept;
     [[nodiscard]] ExpertResidencyStats expert_residency_stats() const;

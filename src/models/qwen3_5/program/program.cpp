@@ -737,6 +737,16 @@ runtime::ProgramResourceRevision Program::resource_revision() const noexcept {
     return impl_->resource_revision();
 }
 
+ContextCacheOwnerDiagnostics
+Program::context_cache_owner_diagnostics(const ContinuationHandle& owner) const {
+    return impl_->context_cache_owner_diagnostics(owner);
+}
+
+ContextCacheOwnerDiagnostics
+Program::context_cache_owner_diagnostics(const SharedPrefixHandle& owner) const {
+    return impl_->context_cache_owner_diagnostics(owner);
+}
+
 PhysicalUsageSnapshot Program::physical_usage() const noexcept { return impl_->physical_usage(); }
 
 MemorySummary Program::memory_summary() const noexcept { return impl_->memory_summary(); }
@@ -775,7 +785,8 @@ std::size_t prepare_vision_overlay(const execution::Parameters& parameters, Devi
     const models::LoadOptions features = models::load_options(options);
     if (!features.overlay_vision()) { return 0; }
     if (parameters.model.options() != features) {
-        throw std::invalid_argument("loaded components do not match the requested execution options");
+        throw std::invalid_argument(
+            "loaded components do not match the requested execution options");
     }
     EvictableWeightPool* const pool = parameters.model.weight_pool();
     const auto& layout              = parameters.model.vision_overlay();
@@ -784,7 +795,7 @@ std::size_t prepare_vision_overlay(const execution::Parameters& parameters, Devi
     }
     const detail::VisionWorkspacePlan window_plan = execution::plan_vision_window_workspace(
         parameters, detail::vision_item_token_bound(options.max_context, features));
-    const std::size_t window = execution::vision_window_bytes(*layout, window_plan);
+    const std::size_t window    = execution::vision_window_bytes(*layout, window_plan);
     constexpr std::size_t chunk = EvictableWeightPool::kChunkBytes;
     const std::size_t aligned   = (window + chunk - 1) / chunk * chunk;
     if (aligned > pool->evictable_tail_bytes()) {

@@ -911,6 +911,10 @@ public:
         return resource_revision_;
     }
 
+    [[nodiscard]] ContextCacheOwnerDiagnostics
+    context_cache_owner_diagnostics(const ContinuationHandle& owner) const;
+    [[nodiscard]] ContextCacheOwnerDiagnostics
+    context_cache_owner_diagnostics(const SharedPrefixHandle& owner) const;
     [[nodiscard]] qwen3_5::PhysicalUsageSnapshot physical_usage() const noexcept;
 
     [[nodiscard]] std::optional<std::uint32_t>
@@ -968,6 +972,7 @@ public:
                (static_cast<std::uint32_t>(proposal_head) << 8U) |
                (static_cast<std::uint32_t>(kv_storage) << 16U);
     }
+
     const bool vision_enabled;
     const bool use_cuda_graph;
     const bool causal_scoring;
@@ -1227,23 +1232,23 @@ private:
     // endpoint StateImage, and the tail page and StateImage of its rewrite seam and earliest long
     // anchors. Items are staged a batch at a time through the tier's own staging memory.
     struct DiskSpillItem {
-        DiskKVKind kind         = DiskKVKind::MainKV;
-        std::uint32_t frontier  = 0; // the digest frontier that keys the item
-        std::uint32_t page      = 0; // KV row page for KV items
+        DiskKVKind kind        = DiskKVKind::MainKV;
+        std::uint32_t frontier = 0; // the digest frontier that keys the item
+        std::uint32_t page     = 0; // KV row page for KV items
         StateImageHandle state;
     };
 
     struct DiskOwnerSpill {
         std::vector<DiskSpillItem> items;
-        std::size_t next = 0;
+        std::size_t next      = 0;
         DiskKVKind batch_kind = DiskKVKind::MainKV;
         std::vector<DiskKVIdentity> batch_ids;
         std::vector<std::span<const std::byte>> batch_bytes;
         std::size_t batch_submitted = 0;
         std::vector<SpillTicket> tickets;
-        std::uint64_t written      = 0;
-        std::uint64_t deduplicated = 0;
-        bool stopped               = false;
+        std::uint64_t written                               = 0;
+        std::uint64_t deduplicated                          = 0;
+        bool stopped                                        = false;
         std::chrono::steady_clock::time_point last_progress = std::chrono::steady_clock::now();
     };
 
@@ -1752,8 +1757,9 @@ private:
     void publish_checkpoint_drop(SequenceState& sequence, runtime::CheckpointRef checkpoint);
     // Disk tier (storage/disk_tier.cpp).
     void open_disk_tier(const SequencePlanImpl& plan);
-    [[nodiscard]] DiskKVIdentity disk_identity(const qwen3_5::detail::PrefixShortlistDigests& digests,
-                                               std::uint32_t frontier) const;
+    [[nodiscard]] DiskKVIdentity
+    disk_identity(const qwen3_5::detail::PrefixShortlistDigests& digests,
+                  std::uint32_t frontier) const;
     [[nodiscard]] DiskOwnerSpill plan_owner_spill(const SequenceState& sequence) const;
     // One bounded step of an owner's disk write; true once every item is written or skipped.
     [[nodiscard]] bool progress_owner_spill(const SequenceState& sequence, DiskOwnerSpill& spill);
@@ -1992,8 +1998,7 @@ private:
                           std::uint32_t backend_tokens = 0);
     void release_sequence_growth_entitlement(SequenceState& sequence) noexcept;
     void release_active_sequence_kv_strict(SequenceState& sequence) noexcept;
-    void release_sequence_kv_strict(SequenceState& sequence,
-                                    bool written_to_disk = false) noexcept;
+    void release_sequence_kv_strict(SequenceState& sequence, bool written_to_disk = false) noexcept;
     void release_sequence_kv(SequenceState& sequence) noexcept;
     void commit_sequence_kv(SequenceState& sequence, std::uint32_t main_tokens,
                             std::uint32_t backend_tokens = 0);
