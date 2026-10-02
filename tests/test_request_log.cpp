@@ -14,9 +14,9 @@
 #include <vector>
 
 #ifdef _WIN32
-#include <process.h>
+#    include <process.h>
 #else
-#include <unistd.h>
+#    include <unistd.h>
 #endif
 
 namespace {
@@ -429,6 +429,13 @@ int main() {
                                                    .applied               = true};
 
     const Json done = Json::parse(format_request_done_json("serve-test", 3000, context, outcome));
+    failures += check(done.at("materialization").contains("candidates") &&
+                          done.at("materialization").at("candidates").is_array() &&
+                          done.at("materialization").contains("selected_victims") &&
+                          done.at("materialization").at("selected_victims").is_array() &&
+                          done.at("materialization").contains("best_rejected") &&
+                          done.at("materialization").at("best_rejected").is_array(),
+                      "bounded materialization fact arrays missing");
     failures += check(done.at("materialization").at("initial_predicted_total_ns") == 500000 &&
                           done.at("materialization").at("first_improvement_ns") == 2000 &&
                           done.at("materialization").at("search_granted_ns") == 8000 &&
@@ -487,6 +494,84 @@ int main() {
             done.at("engine_timing").at("decode").at("rounds") == 2 &&
             done.at("engine_timing").at("units").at("prefill") == 4,
         "request Engine timing exposure is incomplete");
+
+    GenerationOutcome diagnostic_outcome = outcome;
+    auto& facts                          = diagnostic_outcome.metrics.materialization;
+    for (std::uint32_t index = 0; index < 20; ++index) {
+        facts.candidates.push_back({.candidate_id     = index,
+                                    .kind             = ninfer::PrefixReusePath::PrivateEndpoint,
+                                    .matched_tokens   = 12000 + index,
+                                    .physical_status  = "infeasible",
+                                    .expandable       = true,
+                                    .source_mode      = "retain",
+                                    .retention_reason = "endpoint_alias",
+                                    .lower_bound_ns   = 7000 + index});
+        ninfer::ContextCacheOwnerDiagnostics owner;
+        owner.kind               = "private_continuation";
+        owner.owner_id           = 100 + index;
+        owner.slot               = index;
+        owner.generation         = 0x100000000ULL + index;
+        owner.session_key        = "session-" + std::to_string(index);
+        owner.retention          = "live_session";
+        owner.effective_weight   = 64;
+        owner.age                = 2;
+        owner.frontier_tokens    = 12000;
+        owner.rebuild_ns         = 19000;
+        owner.device_state_slots = 0;
+        owner.host_state_slots   = 1;
+        owner.device_kv_pages    = 3;
+        owner.host_kv_pages      = 7;
+        // An unreported disk placement must remain unknown rather than becoming zero.
+        facts.selected_victims.push_back(
+            {.owner               = owner,
+             .outcome             = "retained",
+             .dropped_checkpoints = {
+                 {.kind = "long_anchor", .frontier_tokens = 8192, .ordinal = 2}}});
+        facts.best_rejected.push_back(
+            {.candidate_id   = index,
+             .target_ordinal = index == 0 ? std::nullopt : std::optional(index + 42),
+             .kind           = ninfer::PrefixReusePath::PrivateEndpoint,
+             .matched_tokens = 12000,
+             .source_mode    = "retain",
+             .now_ns         = 1000,
+             .future_loss_ns = 9000,
+             .total_ns       = 10000});
+    }
+    const auto bounded_done =
+        Json::parse(format_request_done_json("serve-test", 3010, context, diagnostic_outcome));
+    const auto& bounded_facts = bounded_done.at("materialization");
+    failures += check(bounded_facts.at("candidates").size() == 8 &&
+                          bounded_facts.at("selected_victims").size() == 16 &&
+                          bounded_facts.at("best_rejected").size() == 3,
+                      "materialization fact arrays exceeded record bounds");
+    const auto& candidate_fact = bounded_facts.at("candidates").at(0);
+    const auto& victim_fact    = bounded_facts.at("selected_victims").at(0);
+    const auto& rejected_fact  = bounded_facts.at("best_rejected").at(0);
+    failures += check(candidate_fact.at("kind") == "private_endpoint" &&
+                          candidate_fact.at("matched_tokens") == 12000 &&
+                          candidate_fact.at("physical_status") == "infeasible" &&
+                          candidate_fact.at("expandable") == true &&
+                          candidate_fact.at("source_mode") == "retain" &&
+                          candidate_fact.at("retention_reason") == "endpoint_alias" &&
+                          candidate_fact.at("lower_bound_ns") == 7000,
+                      "candidate facts lost their identity assessment details");
+    failures +=
+        check(victim_fact.at("owner_id") == 100 && victim_fact.at("generation") == 0x100000000ULL &&
+                  victim_fact.at("session_key") == "session-0" &&
+                  victim_fact.at("retention") == "live_session" &&
+                  victim_fact.at("effective_weight") == 64 && victim_fact.at("age") == 2 &&
+                  victim_fact.at("outcome") == "retained" &&
+                  victim_fact.at("placement").at("host_state_slots") == 1 &&
+                  victim_fact.at("placement").at("device_kv_pages") == 3 &&
+                  victim_fact.at("placement").at("host_kv_pages") == 7 &&
+                  victim_fact.at("placement").at("disk_kv_pages").is_null() &&
+                  victim_fact.at("dropped_checkpoints").at(0).at("kind") == "long_anchor",
+              "victim ownership, placement or checkpoint facts missing or inferred");
+    failures += check(
+        rejected_fact.at("target_ordinal").is_null() && rejected_fact.at("now_ns") == 1000 &&
+            rejected_fact.at("future_loss_ns") == 9000 && rejected_fact.at("total_ns") == 10000 &&
+            bounded_facts.at("best_rejected").at(1).at("target_ordinal") == 43,
+        "evaluated rejected costs or target identity missing");
 
     const OperationalRecord pretty_done = render_request_done(context, outcome);
     failures += check(
@@ -611,6 +696,10 @@ int main() {
                                .context_progress_invocations  = 4,
                                .stats_publication_invocations = 5,
     };
+    for (const auto& victim : facts.selected_victims) {
+        throughput.current.context_cache_catalog.push_back(victim.owner);
+    }
+    throughput.previous.context_cache_catalog.push_back({.kind = "old-owner", .owner_id = 99999});
     const std::string pretty_throughput = render_throughput(throughput).message;
     failures +=
         check(pretty_throughput ==
@@ -637,6 +726,16 @@ int main() {
     const Json throughput_json =
         Json::parse(format_throughput_json("serve-test", 5000, throughput));
     failures += check(throughput_json.at("event") == "throughput", "throughput event mismatch");
+    failures +=
+        check(throughput_json.at("context_cache").at("catalog").size() == 16 &&
+                  throughput_json.at("context_cache").at("catalog").at(0).at("owner_id") == 100 &&
+                  throughput_json.at("context_cache")
+                      .at("catalog")
+                      .at(0)
+                      .at("placement")
+                      .at("disk_kv_pages")
+                      .is_null(),
+              "catalog snapshot missing, unbounded or derived from old snapshot");
     failures += check(throughput_json.at("tokens").at("computed_prefill") == 100 &&
                           throughput_json.at("tokens").at("committed_decode") == 40,
                       "throughput token deltas mismatch");
@@ -686,15 +785,14 @@ int main() {
             !throughput_json.at("context_cache").contains("last_materialization"),
         "context-cache throughput statistics missing or not interval-scoped");
 
-    const std::filesystem::path log_path =
-        std::filesystem::temp_directory_path() /
-        ("ninfer-request-log-test-" +
+    const std::filesystem::path log_path = std::filesystem::temp_directory_path() /
+                                           ("ninfer-request-log-test-" +
 #ifdef _WIN32
-         std::to_string(static_cast<long long>(::_getpid())) +
+                                            std::to_string(static_cast<long long>(::_getpid())) +
 #else
-         std::to_string(static_cast<long long>(::getpid())) +
+                                            std::to_string(static_cast<long long>(::getpid())) +
 #endif
-         ".jsonl");
+                                            ".jsonl");
     std::filesystem::remove(log_path);
     {
         JsonlRequestLog writer(log_path.string());

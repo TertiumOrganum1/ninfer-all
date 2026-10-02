@@ -227,8 +227,8 @@ struct EngineOptions {
     // </think> close the frontend appends when the message lacks it. Empty preserves the
     // model's built-in end-of-thinking control suffix.
     std::string thinking_budget_message;
-    EnginePurpose purpose              = EnginePurpose::Generation;
-    int device                         = 0;
+    EnginePurpose purpose = EnginePurpose::Generation;
+    int device            = 0;
     // Empty or one entry keeps the single-device route and `device` selects it. Several entries
     // split the model's layers into that many pipeline stages, one per device, in the given order:
     // the first holds the embedding, head and round state. Matching compute capability is required
@@ -238,7 +238,7 @@ struct EngineOptions {
     // Layers per stage, one count per entry of `devices`. Empty lets the engine choose from each
     // device's free memory.
     std::vector<std::uint32_t> stage_layers;
-    std::uint32_t max_context          = 2048; // Logical ceiling of one request or score window.
+    std::uint32_t max_context = 2048; // Logical ceiling of one request or score window.
     // Past the model's native window (max_position_embeddings), up to four times it: positions run
     // unscaled RoPE, or with rope_yarn the whole window takes Qwen's YaRN at factor
     // max_context / native (ops::RopeYarn).
@@ -259,8 +259,8 @@ struct EngineOptions {
     std::uint32_t prefill_chunk        = 1024;
     // Prefill with the fast INT8-KV prompt-attention kernel and round prefill_chunk down to whole
     // prompt-attention waves. Off keeps the default kernel and the requested chunk.
-    bool fast_prefill_kernel           = false;
-    KvCacheStorage kv_cache            = KvCacheStorage::BFloat16;
+    bool fast_prefill_kernel = false;
+    KvCacheStorage kv_cache  = KvCacheStorage::BFloat16;
     SpeculativeOptions speculative;
     std::size_t media_cache_bytes = kDefaultMediaCacheBytes;
     std::size_t media_live_bytes  = kDefaultMediaLiveBytes;
@@ -273,39 +273,39 @@ struct EngineOptions {
     // C8 decode gain (~3%, real chat prompts); gdn_state_fp16 is free within measurement noise
     // (bit-identical greedy output, unchanged perplexity) for a ~2% C8 gain and a halved
     // per-slot host state image.
-    bool lm_head_q4                        = false;
-    bool gdn_state_fp16                    = false;
+    bool lm_head_q4     = false;
+    bool gdn_state_fp16 = false;
     // Device-memory trades that store a W8 vocabulary matrix at a narrower group-64 width while
     // the weights load (the artifact is unchanged). lm_head_q6 saves ~26% of the output head for
     // +0.01% perplexity; embedding_q4 halves the token embedding with no measurable perplexity
     // change. lm_head_q4 and lm_head_q6 are mutually exclusive.
-    bool lm_head_q6                        = false;
-    bool embedding_q4                      = false;
+    bool lm_head_q6   = false;
+    bool embedding_q4 = false;
     // Q6G64 token embedding: the narrower-model option where Q4 costs measurable perplexity
     // (the 35B-A3B's 2048-wide table). Mutually exclusive with embedding_q4.
-    bool embedding_q6                      = false;
+    bool embedding_q6 = false;
     // Qwen3.6-35B-A3B only: the MTP draft layer's routed experts are stored W8 in the artifact;
     // transcode them to the text layers' formats (Q4 gate_up, Q6 down) at load. Drafts are
     // verified exactly, so this can change acceptance but never the output distribution.
-    bool mtp_experts_q4                    = false;
+    bool mtp_experts_q4 = false;
     // Integer-activation MLP gate_up at decode and verify widths. Measured 4-6% off that Op from
     // sixteen columns up; see docs/maintainer/quality-trade-experiments.md.
-    bool mlp_a8_decode                     = false;
+    bool mlp_a8_decode = false;
     // Integer-activation routes at full prefill tiles, on by default where a route is registered.
     // Clearing it returns prefill to the A16 routes, which is the only way to measure what the
     // integer routes are worth on a whole request rather than per Op.
-    bool prefill_a8                        = true;
+    bool prefill_a8 = true;
     // Hand wide prefill GEMMs to cuBLAS instead of this fork's integer mainloop: the weight is
     // materialised as int8 with one scale per row and the activations quantised per token, which
     // runs about twice as fast (ops/linear_swiglu/q4cublas/w4_cublas_prefill.h) and is a further
     // quality trade on top of prefill_a8 -- hence off by default. Its dequantise pass is
     // weight-sized, so it wants a large prefill_chunk to amortise; the two belong together.
-    bool prefill_cublas                    = false;
+    bool prefill_cublas = false;
     // Extends prefill_cublas to the attention and GDN input projections, which hold about a fifth
     // of the linear parameters. Worth +13% prefill for +0.071% perplexity on top of what the route
     // already costs, the GDN half carrying nearly all of both. Separable because that is a
     // different trade from the MLP one and an owner may want only the cheaper half.
-    bool prefill_cublas_projections        = true;
+    bool prefill_cublas_projections = true;
     // Largest merged-token count one media item may occupy; larger media is downscaled at
     // preprocessing. Also bounds the overlay window.
     std::uint32_t vision_max_merged_tokens = 16384;
@@ -497,10 +497,10 @@ struct ToolCallParseDiagnostics {
     bool marker_seen = false;
     // A forced call whose closing tag the model never emitted was closed by the decoder. Only the
     // outer tag is ever supplied, so no argument byte is invented.
-    bool forced_call_closed                     = false;
-    std::uint32_t structured_call_count         = 0;
-    std::uint32_t empty_arguments_omitted       = 0;
-    std::uint32_t schema_mismatch_arguments     = 0;
+    bool forced_call_closed                 = false;
+    std::uint32_t structured_call_count     = 0;
+    std::uint32_t empty_arguments_omitted   = 0;
+    std::uint32_t schema_mismatch_arguments = 0;
     // Repeated parameters of a call, resolved to their last value.
     std::uint32_t duplicate_parameters_repaired = 0;
     // Why the strict pass rejected the region. With recovered set, the region still produced
@@ -691,6 +691,7 @@ struct PromptInput {
 class ContextCacheExhausted final : public std::bad_alloc {
 public:
     explicit ContextCacheExhausted(std::string message) : message_(std::move(message)) {}
+
     [[nodiscard]] const char* what() const noexcept override { return message_.c_str(); }
 
 private:
@@ -851,15 +852,15 @@ struct GenerationTimings {
     double vision_seconds      = 0.0;
     double prefill_seconds     = 0.0;
     // Overlay vision residency: per-request sums over the image windows.
-    std::uint32_t overlay_windows      = 0;
-    double overlay_window_seconds      = 0.0;
-    double overlay_evict_seconds       = 0.0;
-    double overlay_restore_seconds     = 0.0;
-    std::size_t overlay_evicted_bytes  = 0;
-    std::size_t overlay_staged_bytes   = 0;
+    std::uint32_t overlay_windows     = 0;
+    double overlay_window_seconds     = 0.0;
+    double overlay_evict_seconds      = 0.0;
+    double overlay_restore_seconds    = 0.0;
+    std::size_t overlay_evicted_bytes = 0;
+    std::size_t overlay_staged_bytes  = 0;
     // Windows that had to borrow the text weights, which stalls every other lane.
     std::uint32_t overlay_exclusive_windows = 0;
-    double decode_seconds      = 0.0;
+    double decode_seconds                   = 0.0;
     // Request wall phases at committed model-state boundaries. Prompt begins when admission and
     // its exact reuse choice are published and ends at the first accepted output token. Generation
     // spans the first through last accepted output token and therefore has N-1 token intervals.
@@ -980,6 +981,80 @@ materialization_search_phase_name(MaterializationSearchPhase phase) noexcept {
     return "none";
 }
 
+inline constexpr std::size_t kMaximumMaterializationCandidates    = 8;
+inline constexpr std::size_t kMaximumMaterializationVictims       = 16;
+inline constexpr std::size_t kMaximumMaterializationRejectedPlans = 3;
+inline constexpr std::size_t kMaximumContextCacheCatalogOwners    = 16;
+
+struct MaterializationCandidateDiagnostics {
+    std::uint32_t candidate_id   = 0;
+    PrefixReusePath kind         = PrefixReusePath::Root;
+    std::uint32_t matched_tokens = 0;
+    std::string physical_status;
+    bool expandable = false;
+    std::string source_mode;
+    std::string retention_reason;
+    std::uint64_t lower_bound_ns = 0;
+
+    [[nodiscard]] friend bool operator==(const MaterializationCandidateDiagnostics&,
+                                         const MaterializationCandidateDiagnostics&) = default;
+};
+
+struct MaterializationRejectedPlanDiagnostics {
+    std::uint32_t candidate_id = 0;
+    // Identity projections have no pressure target ordinal.
+    std::optional<std::uint32_t> target_ordinal;
+    PrefixReusePath kind         = PrefixReusePath::Root;
+    std::uint32_t matched_tokens = 0;
+    std::string source_mode;
+    std::uint64_t now_ns         = 0;
+    std::uint64_t future_loss_ns = 0;
+    std::uint64_t total_ns       = 0;
+
+    [[nodiscard]] friend bool operator==(const MaterializationRejectedPlanDiagnostics&,
+                                         const MaterializationRejectedPlanDiagnostics&) = default;
+};
+
+struct ContextCacheCheckpointDiagnostics {
+    std::string kind;
+    std::uint32_t frontier_tokens = 0;
+    std::uint32_t ordinal         = 0;
+
+    [[nodiscard]] friend bool operator==(const ContextCacheCheckpointDiagnostics&,
+                                         const ContextCacheCheckpointDiagnostics&) = default;
+};
+
+struct ContextCacheOwnerDiagnostics {
+    std::string kind;
+    std::uint64_t owner_id   = 0;
+    std::uint32_t slot       = 0;
+    std::uint64_t generation = 0;
+    std::string session_key;
+    std::string retention;
+    std::uint32_t effective_weight = 0;
+    std::uint64_t age              = 0;
+    std::uint32_t frontier_tokens  = 0;
+    std::uint64_t rebuild_ns       = 0;
+    // Unreported physical placement remains unknown, never inferred from transfer costs.
+    std::optional<std::uint32_t> device_state_slots;
+    std::optional<std::uint32_t> host_state_slots;
+    std::optional<std::uint32_t> device_kv_pages;
+    std::optional<std::uint32_t> host_kv_pages;
+    std::optional<std::uint32_t> disk_kv_pages;
+
+    [[nodiscard]] friend bool operator==(const ContextCacheOwnerDiagnostics&,
+                                         const ContextCacheOwnerDiagnostics&) = default;
+};
+
+struct MaterializationVictimDiagnostics {
+    ContextCacheOwnerDiagnostics owner;
+    std::string outcome;
+    std::vector<ContextCacheCheckpointDiagnostics> dropped_checkpoints;
+
+    [[nodiscard]] friend bool operator==(const MaterializationVictimDiagnostics&,
+                                         const MaterializationVictimDiagnostics&) = default;
+};
+
 struct MaterializationDiagnostics {
     std::uint64_t predicted_now_ns           = 0;
     std::uint64_t predicted_future_loss_ns   = 0;
@@ -1004,9 +1079,12 @@ struct MaterializationDiagnostics {
     MaterializationSearchPhase search_stop_phase = MaterializationSearchPhase::None;
     bool search_boundary_limited                 = false;
 
-    [[nodiscard]] friend constexpr bool
-    operator==(const MaterializationDiagnostics&,
-               const MaterializationDiagnostics&) noexcept = default;
+    std::vector<MaterializationCandidateDiagnostics> candidates;
+    std::vector<MaterializationVictimDiagnostics> selected_victims;
+    std::vector<MaterializationRejectedPlanDiagnostics> best_rejected;
+
+    [[nodiscard]] friend bool operator==(const MaterializationDiagnostics&,
+                                         const MaterializationDiagnostics&) noexcept = default;
 };
 
 // A token and its log probability under a raw next-token distribution.
@@ -1125,6 +1203,7 @@ struct RuntimeHostWorkStats {
 // Monotonic execution counters, boundary-consistent current gauges, and explicitly named last
 // decision observations. Consumers derive interval counters by subtracting two snapshots.
 struct RuntimeStats {
+    std::vector<ContextCacheOwnerDiagnostics> context_cache_catalog;
     RuntimeHostWorkStats host_work;
     // Actual prompt tokens evaluated by prefill; reused checkpoint-prefix tokens are excluded.
     std::uint64_t computed_prefill_tokens = 0;
@@ -1240,8 +1319,8 @@ struct ContextCostSummary {
 // renders these into the OpenAI-compatible /v1/models model object and its llama.cpp-compatible
 // `meta` field.
 struct ModelMetadata {
-    std::string model_id;    // Artifact model name (directory metadata "name").
-    std::string weights_id;  // Encoded formats of the artifact tensors (meta ftype).
+    std::string model_id;             // Artifact model name (directory metadata "name").
+    std::string weights_id;           // Encoded formats of the artifact tensors (meta ftype).
     std::uint64_t vocab_size     = 0; // Tokenizer token domain (meta n_vocab).
     std::uint64_t embedding_size = 0; // Model embedding width (meta n_embd).
     std::uint64_t native_context = 0; // Model native/training context (meta n_ctx_train).

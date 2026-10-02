@@ -480,15 +480,21 @@ std::optional<AdmissionCandidate> ProgramImpl::inspect_lane(
                                              *shared_identity, selected.frontier)) {
             return std::nullopt;
         }
-        plan->reuse              = ReusePath::SharedStablePrefix;
-        plan->reuse_base         = selected.frontier;
+        plan->reuse       = ReusePath::SharedStablePrefix;
+        plan->reuse_base  = selected.frontier;
         plan->source_mode = runtime::PrivateSourceMode::Retain;
+        plan->identity_assessment.source_retention_reason =
+            runtime::PrivateSourceRetentionReason::SharedSource;
     } else if (source != nullptr) {
         const runtime::CheckpointRef selected = *checkpoint;
         plan->selected_checkpoint             = selected;
         plan->source_mode                     = must_retain_private_source
-                                                     ? runtime::PrivateSourceMode::Retain
-                                                     : runtime::PrivateSourceMode::ConsumeToActive;
+                                                    ? runtime::PrivateSourceMode::Retain
+                                                    : runtime::PrivateSourceMode::ConsumeToActive;
+        if (must_retain_private_source) {
+            plan->identity_assessment.source_retention_reason =
+                runtime::PrivateSourceRetentionReason::SessionOwnership;
+        }
         if (!base.allow_prefix_reuse || !prompt.identity.reusable) { return std::nullopt; }
         if (selected.kind == runtime::CheckpointKind::SessionEndpoint) {
             if (selected.ordinal != 0) {
@@ -517,9 +523,11 @@ std::optional<AdmissionCandidate> ProgramImpl::inspect_lane(
                                                  selected.frontier)) {
                 return std::nullopt;
             }
-            plan->reuse              = ReusePath::PrivateLongAnchor;
-            plan->reuse_base         = selected.frontier;
+            plan->reuse       = ReusePath::PrivateLongAnchor;
+            plan->reuse_base  = selected.frontier;
             plan->source_mode = runtime::PrivateSourceMode::Retain;
+            plan->identity_assessment.source_retention_reason =
+                runtime::PrivateSourceRetentionReason::LongAnchor;
         } else {
             if (selected.ordinal != 0) {
                 throw std::logic_error("private rewrite checkpoint ordinal is invalid");
@@ -615,6 +623,8 @@ std::optional<AdmissionCandidate> ProgramImpl::inspect_lane(
         if (std::find(optional_states.begin(), optional_states.end(), endpoint) !=
             optional_states.end()) {
             plan->source_mode = runtime::PrivateSourceMode::Retain;
+            plan->identity_assessment.source_retention_reason =
+                runtime::PrivateSourceRetentionReason::EndpointAlias;
         } else {
             std::vector<StateImageHandle> unique;
             unique.reserve(optional_states.size());
@@ -636,8 +646,7 @@ std::optional<AdmissionCandidate> ProgramImpl::inspect_lane(
             }
         }
     }
-    if (source != nullptr &&
-        plan->source_mode == runtime::PrivateSourceMode::ConsumeToActive) {
+    if (source != nullptr && plan->source_mode == runtime::PrivateSourceMode::ConsumeToActive) {
         plan->state_fork_required =
             selected_state_requires_fork(*source, plan->reuse, plan->rewrite_disposition,
                                          plan->selected_checkpoint, plan->reuse_base);
@@ -737,11 +746,10 @@ std::optional<AdmissionCandidate> ProgramImpl::inspect_lane(
         }
     }
 
-    const std::size_t prefill_splits = plan->vision ? plan->vision->uses.size() : 0ULL;
-    plan->summary.service_work_quanta =
-        projected_service_work(plan->summary, service_work_base(*plan), prefill_chunk,
-                               prefill_splits, plan->capture_groups,
-                               prompt.identity.rewrite_execution_frontiers);
+    const std::size_t prefill_splits  = plan->vision ? plan->vision->uses.size() : 0ULL;
+    plan->summary.service_work_quanta = projected_service_work(
+        plan->summary, service_work_base(*plan), prefill_chunk, prefill_splits,
+        plan->capture_groups, prompt.identity.rewrite_execution_frontiers);
     std::uint64_t remaining_vision_items   = 0;
     std::uint64_t remaining_vision_patches = 0;
     if (plan->vision) {
@@ -853,8 +861,7 @@ std::optional<AdmissionCandidate> ProgramImpl::inspect_lane(
         const bool splits_private_both =
             source != nullptr && selected_state_residency == StateReplicaResidency::Both;
         const bool forks_device_state =
-            (plan->source_mode == runtime::PrivateSourceMode::Retain &&
-             !splits_private_both) ||
+            (plan->source_mode == runtime::PrivateSourceMode::Retain && !splits_private_both) ||
             (plan->source_mode == runtime::PrivateSourceMode::ConsumeToActive &&
              plan->state_fork_required);
         if (is_masked_draft_backend(speculative_backend) && forks_device_state &&
@@ -1294,9 +1301,8 @@ void ProgramImpl::select_shared_captures(AdmissionCandidate& candidate,
 
     const std::size_t prefill_splits = plan.vision ? plan.vision->uses.size() : 0ULL;
     plan.summary.service_work_quanta =
-        projected_service_work(plan.summary, service_work_base(plan), prefill_chunk,
-                               prefill_splits, plan.capture_groups,
-                               prompt.identity.rewrite_execution_frontiers);
+        projected_service_work(plan.summary, service_work_base(plan), prefill_chunk, prefill_splits,
+                               plan.capture_groups, prompt.identity.rewrite_execution_frontiers);
     std::uint64_t vision_items   = 0;
     std::uint64_t vision_patches = 0;
     if (plan.vision) {

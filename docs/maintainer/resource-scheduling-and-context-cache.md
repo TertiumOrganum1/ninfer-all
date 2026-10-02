@@ -456,9 +456,11 @@ TerminalPending request 继续持有 `SequenceHandle` 和完整 reservation，�
 - **Finish**：发布一个完整 immutable checkpoint；或
 - **Discard**：释放整个 active continuation。
 
-若 Finish 无法形成合法保留终态，必须采用 Discard。Optional capture 可以通过同一 pressure graph 改变
-inactive owners，但只有严格优于 private-only baseline 的完整终态才会提交；否则跳过 shared publication，
-不阻塞 active request，也不改变同一 frontier 原本可执行的 private capture。
+If Finish cannot form a valid retained terminal state, it must Discard. Optional capture can
+change inactive owners through the same pressure graph only for a strictly positive complete
+transition. Its baseline is the feasible private-only capture at that frontier, or Skip when that
+capture cannot fit. A rejected optional publication does not block the active request or prevent
+an otherwise feasible private capture.
 
 ### 6.3 Persistent backfill proof
 
@@ -559,8 +561,10 @@ Shared candidate 必须在 prefill 前决定是否增加 split，而物理状态
    demote/evict 多个合法 inactive private/shared owners。shared catalog 已满时，logical replacement 与其他
    物理 victims 属于同一个 target 和同一个 transaction。
 
-实际 planner 的 baseline 是同一 frontier 的 private-only policy。Shared publication 是可选投资：没有可行
-且严格正收益的 target 时执行 private baseline 或 Skip。
+The planner uses the physically feasible private-only capture at the same frontier as its
+baseline. If that baseline cannot fit, every private-only or combined private/shared scenario
+compares against Skip, including the private recovery benefit and full immediate cost. Without a
+feasible, strictly positive target, it executes the feasible private baseline or skips capture.
 
 ### 7.3 Target
 
@@ -696,6 +700,40 @@ PrivateLoss_o(S_b,S_t)=w_o\max_{p\in o}
 | Disposable | 1 |
 | RecentPrivate | 4 |
 | LiveSession | 16 |
+
+These are base weights. Private owners record their last touch in the manager's committed-request
+clock: publication and a successful selected-source hit refresh it. `commit_demand` advances that
+clock only when materialization is published; inspection and aborted reservations do not age it.
+All materialization, shared projection, and capture folds apply the same effective weight:
+
+| Request age | Base-weight multiplier |
+|---|---:|
+| 0-1 | 4 |
+| 2-4 | 2 |
+| 5-16 | 1 |
+| 17-64 | 1/2 |
+| 65+ | 1/4 |
+
+Integer division has a floor of 1. Disposable remains 1 regardless of age. A successfully
+published successor demotes its retained private source to Disposable without deleting its
+checkpoints. Replaced session bindings receive the same demotion. Failed/cancelled successors,
+non-updating session reads, and a source belonging to another live session retain their policy;
+publication order still prevents an older completion from replacing the current binding.
+
+Private capture remains eligible for reclamation after pressure-assisted admission. Admission
+reserves the active request; it does not guarantee that a later ResponseReplay checkpoint has a
+free StateImage. If a private-only capture cannot fit, the capture planner compares complete
+pressure targets against skipping it. The new checkpoint contributes its expected recovery saving
+multiplied by the active owner's age-zero retention weight. Public portfolio loss, private resident
+loss, and the full capture/pressure transfer cost must be strictly smaller than that benefit;
+ties, unsupported recovery, and saturated costs do not justify reclamation. When the private baseline is
+physically feasible, shared-capture comparison uses that baseline and adds no private gain. When
+it is infeasible, both private-only and combined private/shared scenarios compare against Skip
+with the same private gain and full immediate cost, so their scores remain comparable.
+There is no unconditional oldest-owner eviction after an economic rejection. Active private
+sources, shared references, and transaction pins remain protected, and the Program rechecks
+physical feasibility before reserve. Skipping this route after every pressured admission can leave
+only an endpoint that no longer matches a canonicalized assistant response on the next turn.
 
 Shared owner 没有固定 retention multiplier。`ExplicitBoundary` 或 `RequestedAutomatic` 在 publication 时带来
 一个 owner-scoped credit；它在第一次后续 exact match 时消费，或在 32 次成功 materialization 后到期。
@@ -965,7 +1003,24 @@ SessionKey 属于 ResourceManager，只提供 candidate lookup 与 binding。Pro
 
 Capability generation 判断 handle 是否仍有效，publication order 判断哪个完成结果更新 session；两者职责不同。
 
-### 10.3 Logical publication capacity
+### 10.3 Decision diagnostics
+
+Each request's materialization report carries at most 8 candidate identities, 16 selected victims,
+and 3 best rejected exact feasible plans. The selected identity is included even if it lies beyond
+the first 8 candidates. Rejected guidance estimates and physically/logically infeasible plans are
+excluded; superseded feasible incumbents remain eligible. Source mode and its retention reason
+are physical ownership facts, independent of policy weights.
+
+Victim facts describe the assessed plan before mutation: logical owner, slot/generation, session,
+retention class/effective weight/request age, largest checkpoint frontier/rebuild cost, disposition,
+and exact dropped checkpoints. Device/host placement inventories deduplicate state aliases and
+logical KV pages within each typed pool. Counts include each owner's shared references, so they
+must not be summed as exclusive global occupancy. Disk replicas are independent persistent prefix
+identities; an enabled disk tier reports unknown (`null`) owner disk coverage, while a disabled tier
+reports zero. Interval context-cache telemetry includes at most 16 catalogued owners with the same
+policy and placement facts. No prompt or generated token content is logged.
+
+### 10.4 Logical publication capacity
 
 ResourceManager 必须在 Program mutation 前预留 active/private/shared destination slot。Program commit 后的
 logical adoption 不再扩容或搜索 slot。
@@ -1026,8 +1081,8 @@ Context cache disabled 时采用 root-only 语义：不读取或发布 inactive 
 13. Planner 成本模型只排序可行 targets，不参与物理正确性。
 14. Session binding 只接受更大的 publication order。
 15. Retention 或 capture 失败必须退化为 skip/release，使 active lane 有有限终态。
-16. Shared publication 必须严格优于 private-only baseline；单个 demand 对嵌套 prefixes 只能贡献一次最大
-    saving。
+16. Shared publication must strictly beat the feasible private-only baseline, or Skip if that
+    baseline is infeasible; one demand contributes only its maximum saving across nested prefixes.
 17. Candidate selection 不是资源预留；实际 capture target 必须在 frontier 到达后按当前 revision 重新
     证明完整物理终态。
 

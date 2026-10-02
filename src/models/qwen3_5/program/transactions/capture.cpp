@@ -247,7 +247,7 @@ ProgramImpl::inspect_capture(const CaptureOffer& offer, const SharedPrefixHandle
     assessment.needs_transfer = !assessment.transfer_requirements.empty();
     assessment.physically_feasible =
         physical_peak_fits(assessment.implementation->demand.physical_peak_additional);
-    if (publish_shared) {
+    if (publish_private || publish_shared) {
         std::vector<runtime::ContextTransferRequirement> recovery;
         recovery.reserve(3);
         if (assessment.state_placement == qwen3_5::CaptureStatePlacement::HostSnapshot) {
@@ -258,7 +258,9 @@ ProgramImpl::inspect_capture(const CaptureOffer& offer, const SharedPrefixHandle
                 state_images->host_layout(), runtime::ContextTransferDirection::DeviceToDevice,
                 true));
         }
-        if (text_snapshot_shape->copied_pages() != 0) {
+        // Private checkpoints keep the active KV address space; only shared publication
+        // snapshots KV into a separate owner and requires these copied tail pages on recovery.
+        if (text_snapshot_shape && text_snapshot_shape->copied_pages() != 0) {
             recovery.push_back(kv_transfer_requirement(
                 runtime::ContextResourceClass::MainKV,
                 runtime::ContextTransferDirection::DeviceToDevice,
