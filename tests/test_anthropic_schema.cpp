@@ -93,6 +93,57 @@ Json parse_event(const std::string& value) {
     return payload;
 }
 
+int test_session_key_validation() {
+    int failures = 0;
+    for (const Json& key :
+         std::vector<Json>{42, 1.5, true, Json::object(), Json::array(), "",
+                           std::string(ninfer::kMaximumContextCacheSessionKeyBytes + 1, 'x')}) {
+        Json body                = base_request();
+        body["prompt_cache_key"] = key;
+        failures += check(api_param([&] { (void)parse(body); }) == "prompt_cache_key",
+                          "invalid session key was accepted");
+    }
+    return failures;
+}
+
+int test_session_key_hints() {
+    int failures                             = 0;
+    Json body                                = base_request();
+    const ninfer::ContextCacheHints absent   = parse(body).cache_hints;
+    body["prompt_cache_key"]                 = nullptr;
+    const ninfer::ContextCacheHints null_key = parse(body).cache_hints;
+    for (const ninfer::ContextCacheHints& hints : {absent, null_key}) {
+        failures += check(
+            !hints.session_key && hints.retention == ninfer::CacheRetentionHint::Default &&
+                hints.update_session_index && hints.markers.empty() &&
+                hints.allow_engine_automatic_shared_prefixes && !hints.allow_engine_prefix_grid,
+            "absent or null session key changed default cache hints");
+    }
+
+    std::string unicode_key;
+    for (std::size_t i = 0; i < ninfer::kMaximumContextCacheSessionKeyBytes / 2; ++i) {
+        unicode_key += "é";
+    }
+    for (const std::string& key :
+         {std::string("session-1"), std::string(ninfer::kMaximumContextCacheSessionKeyBytes, 'x'),
+          unicode_key}) {
+        for (bool stream : {false, true}) {
+            body["prompt_cache_key"]               = key;
+            body["stream"]                         = stream;
+            const AnthropicMessagesRequest request = parse(body);
+            failures += check(
+                request.stream == stream && request.cache_hints.session_key == key &&
+                    request.cache_hints.retention == ninfer::CacheRetentionHint::LiveSession &&
+                    request.cache_hints.update_session_index,
+                "session key did not name a live lineage for aggregate/stream requests");
+        }
+    }
+    body["prompt_cache_key"] = unicode_key + "x";
+    failures += check(api_param([&] { (void)parse(body); }) == "prompt_cache_key",
+                      "session key byte limit was treated as a character limit");
+    return failures;
+}
+
 int test_envelope_and_field_policy() {
     Json body             = base_request();
     body["stream"]        = true;
@@ -132,7 +183,7 @@ int test_envelope_and_field_policy() {
     body["top_k"] = 21;
     failures += check(api_param([&] { (void)parse(body); }) == "top_k",
                       "Engine top_k range was not enforced");
-    body                  = base_request();
+    body = base_request();
     body["output_config"] =
         Json{{"format", Json{{"type", "json_schema"}, {"schema", Json{{"type", "object"}}}}}};
     failures += check(parse(body).generation.structured_output.kind ==
@@ -786,6 +837,8 @@ int test_stream() {
 
 int main() {
     int failures = 0;
+    failures += test_session_key_validation();
+    failures += test_session_key_hints();
     failures += test_envelope_and_field_policy();
     failures += test_message_normalization();
     failures += test_attribution_system_block();

@@ -19,6 +19,7 @@ struct GenerationOutcome;
 struct AnthropicMessagesRequest {
     std::string model;
     GenerationRequest generation;
+    ninfer::ContextCacheHints cache_hints;
     bool stream                 = false;
     bool output_tokens_explicit = false;
 };
