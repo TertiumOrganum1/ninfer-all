@@ -981,6 +981,24 @@ std::string parse_model(const Json& body) {
     return body.at("model").get<std::string>();
 }
 
+ninfer::ContextCacheHints parse_prompt_cache_hints(const Json& body) {
+    ninfer::ContextCacheHints hints;
+    const auto value = body.find("prompt_cache_key");
+    if (value == body.end() || value->is_null()) { return hints; }
+    if (!value->is_string()) {
+        bad_request("prompt_cache_key must be a string", "prompt_cache_key");
+    }
+    const std::string& key = value->get_ref<const std::string&>();
+    if (key.empty()) { bad_request("prompt_cache_key must not be empty", "prompt_cache_key"); }
+    if (key.size() > ninfer::kMaximumContextCacheSessionKeyBytes) {
+        bad_request("prompt_cache_key exceeds the session key byte limit", "prompt_cache_key");
+    }
+    hints.session_key          = key;
+    hints.retention            = ninfer::CacheRetentionHint::LiveSession;
+    hints.update_session_index = true;
+    return hints;
+}
+
 void apply_anthropic_prompt_cache_policy(const Json& body, GenerationRequest& request) {
     std::vector<std::optional<CacheBoundary>*> explicit_boundaries;
     for (ToolDefinition& tool : request.tools) {
@@ -1080,6 +1098,7 @@ AnthropicMessagesRequest parse_anthropic_messages_request(const Json& body,
     require_object(body);
     AnthropicMessagesRequest result;
     result.model                           = parse_model(body);
+    result.cache_hints                     = parse_prompt_cache_hints(body);
     result.generation.tool_name_max_length = kMaxToolNameLength;
     result.stream                          = optional_bool(body, "stream", false);
 

@@ -75,10 +75,10 @@ void HttpServer::handle_messages(const httplib::Request& req, httplib::Response&
                                       .output_tokens_explicit = request.output_tokens_explicit};
     PreparedRequest prepared;
     try {
-        prepared            = service->prepare(request.generation,
-                                               request.stream ? GenerationConsumerMode::Streaming
-                                                              : GenerationConsumerMode::Aggregate,
-                                               {}, [&req] { return client_disconnected(req); });
+        prepared = service->prepare(
+            request.generation,
+            request.stream ? GenerationConsumerMode::Streaming : GenerationConsumerMode::Aggregate,
+            {}, [&req] { return client_disconnected(req); }, request.cache_hints);
         prepared.model_hold = std::make_shared<ModelRegistry::Lease>(std::move(lease));
     } catch (const ApiException& exception) {
         const ApiError error = normalize_anthropic_error(exception.error());

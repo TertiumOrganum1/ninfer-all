@@ -2113,6 +2113,14 @@ creation unknown. Streaming emits `message_start` after Engine admission commits
 selection and before transfer/prefill output, so its uncached/cache-read split is already exact;
 terminal cumulative usage matches the aggregate response.
 
+The local `prompt_cache_key` extension names a client-managed conversation for both aggregate and
+streaming Messages. A non-empty string of at most 256 UTF-8 bytes selects `LiveSession` retention
+and advances that session's continuation index after successful publication. Reuse still requires
+exact rendered-token compatibility; the key does not alter the prompt or bypass matching.
+Omitting the key or passing `null` keeps anonymous continuation behavior. Other value types, an
+empty string, and keys above the byte limit are rejected at `prompt_cache_key`. This session hint
+is independent of `cache_control`, which continues to mark shared prefix frontiers.
+
 Documents, Search Results, Files, server-tool results, container uploads, and
 other execution-dependent blocks are rejected with the missing capability identified. Metadata,
 service tier, inference geography, protocol-version/beta headers, cache TTL, and unknown advisory
